@@ -20,8 +20,9 @@ source .venv/bin/activate
 pip install torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 
-# Install or expose the official Qwen3-TTS source/package.
-# If using a local checkout:
+# Install or expose the official Qwen3-TTS source/package. If qwen-tts is
+# available from your package index, install it directly. Otherwise use a local
+# Qwen3-TTS checkout:
 export QWEN3_TTS_REPO=/path/to/Qwen3-TTS
 export PYTHONPATH="$(pwd):${QWEN3_TTS_REPO}:${PYTHONPATH:-}"
 ```
@@ -111,4 +112,3 @@ Text: ...
 ```
 
 Change this in `qwen3tts_opd/instruction_utils.py` if your Qwen3-TTS checkpoint expects a different control template.
-
