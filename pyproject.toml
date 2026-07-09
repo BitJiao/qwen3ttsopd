@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen3tts-opd"
+version = "0.1.0"
+description = "Instruction OPD/DPO tools for Qwen3-TTS Base."
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+include = ["qwen3tts_opd*"]
+
