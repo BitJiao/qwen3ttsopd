@@ -17,7 +17,3 @@ sentencepiece>=0.2.0
 soundfile>=0.12.1
 transformers>=4.45.0
 tqdm>=4.66.0
-
-# Optional ASR reward backends:
-# faster-whisper>=1.0.0
-

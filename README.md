@@ -1,12 +1,19 @@
-# Qwen3-TTS Instruction OPD
+# Qwen3-TTS On-Policy Distillation
 
-Standalone tools for instruction-controlled OPD/DPO on Qwen3-TTS Base.
+On-policy distillation tools for Qwen3-TTS Base.
 
-The intended setup is asymmetric:
+This repo trains a student on its own sampled audio-code trajectories. A frozen teacher
+scores the same student trajectory token by token while seeing privileged reference
+information.
 
-- Teacher: target text + emotion/style instruction + reference audio/text, using ICL continuation.
-- Student: target text + emotion/style instruction + speaker embedding only.
-- OPD: sample candidates, score them, write chosen/rejected pairs, then train with DPO plus a small chosen NLL term.
+```text
+Student condition: text + instruction + speaker embedding
+Teacher condition: text + instruction + ref_audio/ref_text ICL
+Trajectory:        sampled by the student
+Loss:              KL(teacher next-code distribution || student next-code distribution)
+```
+
+No ASR reward, chosen/rejected pair building, or DPO loss is used.
 
 ## Install
 
@@ -20,9 +27,8 @@ source .venv/bin/activate
 pip install torch==2.3.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 
-# Install or expose the official Qwen3-TTS source/package. If qwen-tts is
-# available from your package index, install it directly. Otherwise use a local
-# Qwen3-TTS checkout:
+# Expose the official Qwen3-TTS source checkout. The OPD trainer uses its
+# inference wrapper and low-level talker forward methods.
 export QWEN3_TTS_REPO=/path/to/Qwen3-TTS
 export PYTHONPATH="$(pwd):${QWEN3_TTS_REPO}:${PYTHONPATH:-}"
 ```
@@ -48,67 +54,52 @@ JSONL rows:
 }
 ```
 
+`ref_text` is required because the teacher uses Qwen3-TTS ICL conditioning.
 Instruction keys accepted: `instruction`, `emotion_instruction`, `style_instruction`, `instruct`.
-
-## Build Preference Pairs
-
-```bash
-MODEL_PATH=/path/to/Qwen3-TTS-12Hz-1.7B-Base \
-INPUT_JSONL=data/train_instruction.jsonl \
-OUTPUT_JSONL=data/opd/pairs.jsonl \
-AUDIO_DIR=data/opd/audio \
-GROUP_SIZE=4 \
-REWARD_ASR_BACKEND=none \
-bash scripts/build_pairs.sh --overwrite
-```
-
-Default reward is `qwen3tts_opd.reward.wer_sim_reward:compute_score`.
-With `REWARD_ASR_BACKEND=none`, WER is disabled and the reward is mostly MFCC speaker similarity.
-For content scoring, set:
-
-```bash
-REWARD_ASR_BACKEND=transformers
-ASR_MODEL_PATH=/path/to/openai-whisper-small
-ASR_DEVICE_INDEX=0
-```
-
-Pair output contains `chosen_codes` and `rejected_codes`, so OPD training does not need to decode audio again.
 
 ## Train OPD
 
 ```bash
-MODEL_PATH=/path/to/sft-or-base-checkpoint \
-REF_MODEL_PATH=/path/to/frozen-reference-checkpoint \
-PAIR_JSONL=data/opd/pairs.jsonl \
-OUTPUT_DIR=checkpoints/qwen3_tts_instruction_opd \
+MODEL_PATH=/path/to/qwen3-tts-student-or-sft-checkpoint \
+TEACHER_MODEL_PATH=/path/to/frozen-teacher-checkpoint \
+INPUT_JSONL=data/train_instruction.jsonl \
+OUTPUT_DIR=checkpoints/qwen3_tts_opd \
 NUM_EPOCHS=1 \
 LR=1e-6 \
-DPO_BETA=0.1 \
-SFT_WEIGHT=0.2 \
 bash scripts/train_opd.sh --overwrite
 ```
 
-Loss:
+If `TEACHER_MODEL_PATH` is omitted, the initial student checkpoint is used as the
+frozen teacher. This is useful for privileged-information OPD where the teacher
+is not a larger model, but sees `ref_audio/ref_text` ICL while the student sees
+only speaker embedding.
 
-```text
-L = DPO(chosen, rejected; frozen_ref) + SFT_WEIGHT * NLL(chosen)
+Useful knobs:
+
+```bash
+KL_TEMPERATURE=1.0
+SUB_KL_WEIGHT=0.3
+STUDENT_CE_WEIGHT=0.05
+MAX_NEW_TOKENS=2048
+SAVE_FREQ=100
 ```
 
-Best practice:
+Per step, the trainer:
 
-1. Generate teacher ICL audio codes and do an instruction SFT first.
-2. Use the SFT checkpoint as `MODEL_PATH`.
-3. Use the same SFT checkpoint frozen as `REF_MODEL_PATH`.
-4. Build OPD pairs and train.
+1. Samples audio codes from the student with x-vector-only voice-clone conditioning.
+2. Replays that exact student code trajectory under the frozen teacher with ICL conditioning.
+3. Replays the same trajectory under the trainable student with x-vector-only conditioning.
+4. Optimizes first-codebook KL plus sub-codebook KL and a small CE term on the student-sampled tokens.
 
 ## Notes
 
-- Reference audio must be compatible with Qwen3-TTS speaker encoder; 24 kHz wav is the safest format.
-- The text seen by the model is formatted as:
+- The teacher and student must share the same Qwen3-TTS audio-code action space.
+- Reference audio must be compatible with the Qwen3-TTS speaker encoder; 24 kHz wav is the safest format.
+- The text seen by both policies is formatted as:
 
 ```text
 Instruction: ...
 Text: ...
 ```
 
-Change this in `qwen3tts_opd/instruction_utils.py` if your Qwen3-TTS checkpoint expects a different control template.
+Change this in `qwen3tts_opd/instruction_utils.py` if your checkpoint expects a different control template.

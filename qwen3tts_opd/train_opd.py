@@ -7,72 +7,75 @@ import random
 import shutil
 import time
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.optim import AdamW
-from transformers import AutoConfig
 
 from qwen3tts_opd.core import (
-    build_training_batch,
+    conditioned_token_logits,
     ensure_qwen3_tts_repo_on_path,
     finish_time,
     format_eta,
+    generate_student_codes,
     load_jsonl,
     load_tts,
-    qwen3_tts_nll,
     resolve_local_model_dir,
     save_checkpoint,
+    token_ce,
+    token_kl,
     torch_dtype,
 )
+from qwen3tts_opd.instruction_utils import with_formatted_text
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Offline preference distillation trainer for Qwen3-TTS pairs.")
-    parser.add_argument("--model_path", required=True)
-    parser.add_argument("--pair_jsonl", required=True)
+    parser = argparse.ArgumentParser(description="On-policy distillation trainer for Qwen3-TTS.")
+    parser.add_argument("--student_model_path", "--model_path", dest="student_model_path", required=True)
+    parser.add_argument("--teacher_model_path", default=None)
+    parser.add_argument("--input_jsonl", required=True)
     parser.add_argument("--output_dir", default="checkpoints/qwen3_tts_opd")
-    parser.add_argument("--ref_model_path", default=None)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--teacher_device", default=None)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--teacher_dtype", default=None, choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--attn_implementation", default="sdpa")
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=0.1)
-    parser.add_argument("--sft_weight", type=float, default=0.2)
-    parser.add_argument("--sub_talker_loss_coef", type=float, default=0.3)
+    parser.add_argument("--kl_temperature", type=float, default=1.0)
+    parser.add_argument("--sub_kl_weight", type=float, default=0.3)
+    parser.add_argument("--student_ce_weight", type=float, default=0.05)
+    parser.add_argument("--instruction_template", default="qwen_control", choices=["qwen_control", "plain", "bracket"])
     parser.add_argument("--save_freq", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--top_k", type=int, default=50)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--subtalker_temperature", type=float, default=0.9)
+    parser.add_argument("--subtalker_top_k", type=int, default=50)
+    parser.add_argument("--subtalker_top_p", type=float, default=1.0)
+    parser.add_argument("--non_streaming_mode", action="store_true", default=True)
+    parser.add_argument("--streaming_mode", dest="non_streaming_mode", action="store_false")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
-def _codes_tensor(row: dict[str, Any], key: str) -> torch.Tensor:
-    return torch.tensor(row[key], dtype=torch.long)
+def _device(requested: str) -> torch.device:
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device(requested)
 
 
-def _build_pair_batches(row: dict[str, Any], processor, config, device: torch.device):
-    base = {
-        "text": row["text"],
-        "ref_audio": row["ref_audio"],
-        "ref_text": row.get("ref_text"),
-        "language": row.get("language", "Auto"),
-    }
-    chosen = build_training_batch(base, _codes_tensor(row, "chosen_codes"), processor, config, device)
-    rejected = build_training_batch(base, _codes_tensor(row, "rejected_codes"), processor, config, device)
-    return chosen, rejected
-
-
-def dpo_loss(policy_chosen_nll, policy_rejected_nll, ref_chosen_nll, ref_rejected_nll, beta: float):
-    policy_logratio = -policy_chosen_nll + policy_rejected_nll
-    ref_logratio = -ref_chosen_nll + ref_rejected_nll
-    return -F.logsigmoid(beta * (policy_logratio - ref_logratio))
+def _validate_row(row: dict) -> None:
+    if "ref_audio" not in row:
+        raise KeyError("each row must contain ref_audio")
+    if not row.get("ref_text"):
+        raise KeyError("OPD teacher ICL requires ref_text for each row")
 
 
 def main() -> None:
@@ -83,30 +86,36 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    local_model_dir = resolve_local_model_dir(args.model_path)
-    ref_model_dir = resolve_local_model_dir(args.ref_model_path or args.model_path)
-    device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
-    dtype = torch_dtype(args.dtype if device.type != "cpu" else "fp32")
+    student_dir = resolve_local_model_dir(args.student_model_path)
+    teacher_dir = resolve_local_model_dir(args.teacher_model_path or args.student_model_path)
+    student_device = _device(args.device)
+    teacher_device = _device(args.teacher_device or args.device)
+    student_dtype = torch_dtype(args.dtype if student_device.type != "cpu" else "fp32")
+    teacher_dtype = torch_dtype((args.teacher_dtype or args.dtype) if teacher_device.type != "cpu" else "fp32")
 
-    tts = load_tts(local_model_dir, dtype, args.attn_implementation, device)
-    if getattr(tts.model, "speaker_encoder", None) is None:
+    student = load_tts(student_dir, student_dtype, args.attn_implementation, student_device)
+    teacher = load_tts(teacher_dir, teacher_dtype, args.attn_implementation, teacher_device)
+    if getattr(student.model, "speaker_encoder", None) is None:
         raise ValueError("Qwen3-TTS OPD requires a Base checkpoint with speaker_encoder.")
-    ref_tts = load_tts(ref_model_dir, dtype, args.attn_implementation, device)
-    ref_tts.model.eval()
-    for param in ref_tts.model.parameters():
+    if getattr(teacher.model, "speaker_encoder", None) is None:
+        raise ValueError("teacher checkpoint must be a Qwen3-TTS Base-compatible checkpoint.")
+
+    teacher.model.eval()
+    for param in teacher.model.parameters():
         param.requires_grad_(False)
 
-    config = AutoConfig.from_pretrained(local_model_dir)
-    data = load_jsonl(args.pair_jsonl)
+    data = [with_formatted_text(row, template=args.instruction_template) for row in load_jsonl(args.input_jsonl)]
     if not data:
-        raise ValueError(f"no pairs loaded from {args.pair_jsonl}")
+        raise ValueError(f"no rows loaded from {args.input_jsonl}")
+    for row in data:
+        _validate_row(row)
 
     output_root = Path(args.output_dir)
     if output_root.exists() and args.overwrite:
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    optimizer = AdamW(tts.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = AdamW(student.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     planned_steps = len(data) * args.num_epochs
     if args.max_steps > 0:
         planned_steps = min(planned_steps, args.max_steps)
@@ -118,44 +127,44 @@ def main() -> None:
             random.shuffle(data)
 
         for row in data:
-            tts.model.train()
-            chosen_batch, rejected_batch = _build_pair_batches(row, tts.processor, config, device)
+            student_codes = generate_student_codes(student, row, args)
+            if student_codes.numel() == 0:
+                continue
 
             with torch.no_grad():
-                ref_chosen_nll, _, _ = qwen3_tts_nll(
-                    ref_tts.model,
-                    chosen_batch,
-                    sub_talker_loss_coef=args.sub_talker_loss_coef,
-                )
-                ref_rejected_nll, _, _ = qwen3_tts_nll(
-                    ref_tts.model,
-                    rejected_batch,
-                    sub_talker_loss_coef=args.sub_talker_loss_coef,
+                teacher_logits = conditioned_token_logits(
+                    teacher,
+                    row,
+                    student_codes.to(teacher_device),
+                    x_vector_only_mode=False,
+                    non_streaming_mode=args.non_streaming_mode,
                 )
 
-            policy_chosen_nll, chosen_codec_loss, chosen_sub_loss = qwen3_tts_nll(
-                tts.model,
-                chosen_batch,
-                sub_talker_loss_coef=args.sub_talker_loss_coef,
-            )
-            policy_rejected_nll, _, _ = qwen3_tts_nll(
-                tts.model,
-                rejected_batch,
-                sub_talker_loss_coef=args.sub_talker_loss_coef,
+            student.model.train()
+            student_logits = conditioned_token_logits(
+                student,
+                row,
+                student_codes.to(student_device),
+                x_vector_only_mode=True,
+                non_streaming_mode=args.non_streaming_mode,
             )
 
-            pref_loss = dpo_loss(
-                policy_chosen_nll,
-                policy_rejected_nll,
-                ref_chosen_nll,
-                ref_rejected_nll,
-                beta=args.beta,
+            first_kl = token_kl(
+                student_logits.first_codebook,
+                teacher_logits.first_codebook.to(student_device),
+                args.kl_temperature,
             )
-            loss = pref_loss + args.sft_weight * policy_chosen_nll
+            sub_kl = token_kl(
+                student_logits.sub_codebooks.reshape(-1, student_logits.sub_codebooks.shape[-1]),
+                teacher_logits.sub_codebooks.to(student_device).reshape(-1, teacher_logits.sub_codebooks.shape[-1]),
+                args.kl_temperature,
+            )
+            ce = token_ce(student_logits.first_codebook, student_codes.to(student_device)[:, 0])
+            loss = first_kl + args.sub_kl_weight * sub_kl + args.student_ce_weight * ce
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(tts.model.parameters(), args.max_grad_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(student.model.parameters(), args.max_grad_norm)
             optimizer.step()
 
             global_step += 1
@@ -168,12 +177,11 @@ def main() -> None:
                         "epoch": epoch,
                         "step": global_step,
                         "total_steps": planned_steps,
+                        "tokens": int(student_codes.shape[0]),
                         "loss": float(loss.detach().cpu()),
-                        "pref_loss": float(pref_loss.detach().cpu()),
-                        "chosen_nll": float(policy_chosen_nll.detach().cpu()),
-                        "rejected_nll": float(policy_rejected_nll.detach().cpu()),
-                        "codec_0_loss": float(chosen_codec_loss.cpu()),
-                        "sub_talker_loss": float(chosen_sub_loss.cpu()),
+                        "first_kl": float(first_kl.detach().cpu()),
+                        "sub_kl": float(sub_kl.detach().cpu()),
+                        "student_ce": float(ce.detach().cpu()),
                         "grad_norm": float(grad_norm.detach().cpu() if torch.is_tensor(grad_norm) else grad_norm),
                         "elapsed": format_eta(elapsed),
                         "eta": format_eta(remaining * avg),
@@ -185,14 +193,13 @@ def main() -> None:
             )
 
             if args.save_freq > 0 and global_step % args.save_freq == 0:
-                save_checkpoint(tts, local_model_dir, str(output_root / f"step_{global_step}"), overwrite=True)
+                save_checkpoint(student, student_dir, str(output_root / f"step_{global_step}"), overwrite=True)
             if args.max_steps > 0 and global_step >= args.max_steps:
-                save_checkpoint(tts, local_model_dir, str(output_root / "final"), overwrite=True)
+                save_checkpoint(student, student_dir, str(output_root / "final"), overwrite=True)
                 return
 
-    save_checkpoint(tts, local_model_dir, str(output_root / "final"), overwrite=True)
+    save_checkpoint(student, student_dir, str(output_root / "final"), overwrite=True)
 
 
 if __name__ == "__main__":
     main()
-

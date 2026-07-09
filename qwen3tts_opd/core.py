@@ -1,21 +1,18 @@
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import json
 import math
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
-from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from safetensors.torch import save_file
 
 
@@ -24,11 +21,13 @@ def ensure_qwen3_tts_repo_on_path() -> None:
     if env_repo and env_repo not in sys.path:
         sys.path.insert(0, env_repo)
 
-    qwen_spec = importlib.util.find_spec("qwen_tts")
-    if qwen_spec is not None and qwen_spec.origin:
-        repo = str(Path(qwen_spec.origin).resolve().parents[1])
-        if repo not in sys.path:
-            sys.path.insert(0, repo)
+
+ensure_qwen3_tts_repo_on_path()
+
+@dataclass
+class TokenLogits:
+    first_codebook: torch.Tensor
+    sub_codebooks: torch.Tensor
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -36,7 +35,7 @@ def load_jsonl(path: str) -> list[dict[str, Any]]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def torch_dtype(name: str):
+def torch_dtype(name: str) -> torch.dtype:
     if name == "bf16":
         return torch.bfloat16
     if name == "fp16":
@@ -50,7 +49,7 @@ def resolve_local_model_dir(model_path: str) -> str:
     return snapshot_download(model_path)
 
 
-def move_tts_to_device(tts: Qwen3TTSModel, device: torch.device | str) -> Qwen3TTSModel:
+def move_tts_to_device(tts, device: torch.device | str):
     device = torch.device(device)
     tts.model.to(device)
     tts.device = device
@@ -64,6 +63,8 @@ def move_tts_to_device(tts: Qwen3TTSModel, device: torch.device | str) -> Qwen3T
 
 
 def load_tts(local_model_dir: str, dtype: torch.dtype, attn_implementation: str, device: torch.device | str):
+    from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+
     tts = Qwen3TTSModel.from_pretrained(
         local_model_dir,
         dtype=dtype,
@@ -72,200 +73,272 @@ def load_tts(local_model_dir: str, dtype: torch.dtype, attn_implementation: str,
     return move_tts_to_device(tts, device)
 
 
-def import_reward_fn(spec: str | None) -> Callable[..., float]:
-    if spec is None:
-        from qwen3tts_opd.reward import wer_sim_reward
-
-        return wer_sim_reward.compute_score
-
-    if ":" not in spec:
-        raise ValueError("--reward_fn must be module:function or /path/file.py:function")
-
-    module_name, fn_name = spec.split(":", 1)
-    if module_name.endswith(".py") or os.path.exists(module_name):
-        module_path = Path(module_name).resolve()
-        loaded = importlib.util.spec_from_file_location(module_path.stem, module_path)
-        if loaded is None or loaded.loader is None:
-            raise ValueError(f"Cannot import reward module from {module_path}")
-        module = importlib.util.module_from_spec(loaded)
-        loaded.loader.exec_module(module)
-    else:
-        module = importlib.import_module(module_name)
-
-    fn = getattr(module, fn_name)
-    if not callable(fn):
-        raise TypeError(f"Reward target is not callable: {spec}")
-    return fn
-
-
-def call_rewards(
-    reward_fn: Callable[..., float],
-    sample: dict[str, Any],
-    wavs: list[np.ndarray],
-    sample_rate: int,
-    codes_list: list[torch.Tensor],
-) -> list[float]:
-    module = importlib.import_module(reward_fn.__module__)
-    batch_fn = getattr(module, "compute_scores", None)
-    if callable(batch_fn):
-        try:
-            values = batch_fn(sample=sample, wavs=wavs, sample_rate=sample_rate, audio_codes_list=codes_list)
-        except TypeError:
-            values = batch_fn(sample, wavs, sample_rate, codes_list)
-        values = [float(value) for value in values]
-        if len(values) != len(wavs):
-            raise ValueError(f"Batch reward returned {len(values)} values for {len(wavs)} wavs")
-        return values
-
-    values = []
-    for codes, wav in zip(codes_list, wavs):
-        try:
-            value = reward_fn(sample=sample, wav=wav, sample_rate=sample_rate, audio_codes=codes)
-        except TypeError:
-            value = reward_fn(sample, wav, sample_rate, codes)
-        values.append(float(value))
-    return values
-
-
-@torch.no_grad()
-def generate_voice_clone_rollouts(tts, sample: dict[str, Any], group_size: int, args):
-    text = sample["text"]
-    language = sample.get("language", "Auto")
-    ref_audio = sample["ref_audio"]
-    ref_text = sample.get("ref_text")
-
-    texts = [text] * group_size
-    languages = [language] * group_size
-    ref_audios = [ref_audio] * group_size
-    ref_texts = [ref_text] * group_size
-    xvec_modes = [args.x_vector_only_mode] * group_size
-
-    input_ids = tts._tokenize_texts([tts._build_assistant_text(t) for t in texts])
+def _prompt_for_sample(tts, sample: dict[str, Any], *, x_vector_only_mode: bool):
     prompt_items = tts.create_voice_clone_prompt(
-        ref_audio=ref_audios,
-        ref_text=ref_texts,
-        x_vector_only_mode=xvec_modes,
+        ref_audio=[sample["ref_audio"]],
+        ref_text=[sample.get("ref_text")],
+        x_vector_only_mode=[x_vector_only_mode],
     )
-    voice_clone_prompt = tts._prompt_items_to_voice_clone_prompt(prompt_items)
+    prompt = tts._prompt_items_to_voice_clone_prompt(prompt_items)
+    input_id = tts._tokenize_texts([tts._build_assistant_text(sample["text"])])[0]
 
-    ref_ids = []
-    for item in prompt_items:
-        if item.ref_text is None or item.ref_text == "":
-            ref_ids.append(None)
-        else:
-            ref_ids.append(tts._tokenize_texts([tts._build_ref_text(item.ref_text)])[0])
+    ref_id = None
+    ref_text = prompt_items[0].ref_text
+    if ref_text is not None and ref_text != "":
+        ref_id = tts._tokenize_texts([tts._build_ref_text(ref_text)])[0]
 
-    codes, _ = tts.model.generate(
-        input_ids=input_ids,
-        ref_ids=ref_ids,
-        voice_clone_prompt=voice_clone_prompt,
-        languages=languages,
-        non_streaming_mode=args.non_streaming_mode,
-        do_sample=True,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        temperature=args.temperature,
-        subtalker_dosample=True,
-        subtalker_top_k=args.subtalker_top_k,
-        subtalker_top_p=args.subtalker_top_p,
-        subtalker_temperature=args.subtalker_temperature,
-        max_new_tokens=args.max_new_tokens,
-    )
-
-    decode_codes = []
-    for idx, generated in enumerate(codes):
-        ref_code = voice_clone_prompt.get("ref_code", [None] * group_size)[idx]
-        if ref_code is None:
-            decode_codes.append(generated)
-        else:
-            decode_codes.append(torch.cat([ref_code.to(generated.device), generated], dim=0))
-
-    wavs_all, sample_rate = tts.model.speech_tokenizer.decode([{"audio_codes": c} for c in decode_codes])
-
-    wavs = []
-    for idx, wav in enumerate(wavs_all):
-        ref_code = voice_clone_prompt.get("ref_code", [None] * group_size)[idx]
-        if ref_code is None:
-            wavs.append(wav)
-            continue
-        ref_len = int(ref_code.shape[0])
-        total_len = int(decode_codes[idx].shape[0])
-        cut = int(ref_len / max(total_len, 1) * wav.shape[0])
-        wavs.append(wav[cut:])
-
-    return codes, wavs, sample_rate
+    return input_id, ref_id, prompt
 
 
-def _load_tts_dataset_class():
-    ensure_qwen3_tts_repo_on_path()
-    from finetuning.dataset import TTSDataset
-
-    return TTSDataset
-
-
-def build_training_batch(sample: dict[str, Any], codes: torch.Tensor, processor, config, device: torch.device):
-    item = dict(sample)
-    item.setdefault("audio", item["ref_audio"])
-    item["audio_codes"] = codes.detach().cpu().tolist()
-    dataset_cls = _load_tts_dataset_class()
-    dataset = dataset_cls([item], processor, config)
-    batch = dataset.collate_fn([dataset[0]])
-    return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
+def _language_id(model, language: str | None):
+    if language is None or language.lower() == "auto":
+        return None
+    language_norm = language.lower()
+    if language_norm not in model.config.talker_config.codec_language_id:
+        raise NotImplementedError(f"Language {language} not implemented")
+    return model.config.talker_config.codec_language_id[language_norm]
 
 
-def qwen3_tts_nll(model, batch: dict[str, torch.Tensor], sub_talker_loss_coef: float):
-    input_ids = batch["input_ids"]
-    codec_ids = batch["codec_ids"]
-    ref_mels = batch["ref_mels"]
-    text_embedding_mask = batch["text_embedding_mask"]
-    codec_embedding_mask = batch["codec_embedding_mask"]
-    attention_mask = batch["attention_mask"]
-    codec_0_labels = batch["codec_0_labels"]
-    codec_mask = batch["codec_mask"]
+def build_voice_clone_prefill(
+    tts,
+    sample: dict[str, Any],
+    *,
+    x_vector_only_mode: bool,
+    non_streaming_mode: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the same voice-clone prefill embeddings used by Qwen3-TTS generate()."""
 
+    model = tts.model
+    talker = model.talker
     device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
+    input_id, ref_id, prompt = _prompt_for_sample(tts, sample, x_vector_only_mode=x_vector_only_mode)
+    input_id = input_id.to(device)
 
-    speaker_embedding = model.speaker_encoder(ref_mels.to(device).to(dtype)).detach()
-    input_text_ids = input_ids[:, :, 0]
-    input_codec_ids = input_ids[:, :, 1]
+    voice_clone_spk_embeds = model.generate_speaker_prompt(prompt)
+    speaker_embed = None
+    if prompt["x_vector_only_mode"][0] or prompt["icl_mode"][0]:
+        speaker_embed = voice_clone_spk_embeds[0].to(device).to(next(model.parameters()).dtype)
 
-    input_text_embedding = model.talker.text_projection(model.talker.model.text_embedding(input_text_ids))
-    input_text_embedding = input_text_embedding * text_embedding_mask
-    input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-    input_codec_embedding[:, 6, :] = speaker_embedding
+    language_id = _language_id(model, sample.get("language", "Auto"))
+    tts_bos_embed, tts_eos_embed, tts_pad_embed = talker.text_projection(
+        talker.get_text_embeddings()(
+            torch.tensor(
+                [[model.config.tts_bos_token_id, model.config.tts_eos_token_id, model.config.tts_pad_token_id]],
+                device=device,
+                dtype=input_id.dtype,
+            )
+        )
+    ).chunk(3, dim=1)
 
-    input_embeddings = input_text_embedding + input_codec_embedding
+    if language_id is None:
+        codec_prefill = [
+            [
+                model.config.talker_config.codec_nothink_id,
+                model.config.talker_config.codec_think_bos_id,
+                model.config.talker_config.codec_think_eos_id,
+            ]
+        ]
+    else:
+        codec_prefill = [
+            [
+                model.config.talker_config.codec_think_id,
+                model.config.talker_config.codec_think_bos_id,
+                language_id,
+                model.config.talker_config.codec_think_eos_id,
+            ]
+        ]
+
+    codec_prefill_embed = talker.get_input_embeddings()(torch.tensor(codec_prefill, device=device, dtype=input_id.dtype))
+    codec_tail_embed = talker.get_input_embeddings()(
+        torch.tensor(
+            [[model.config.talker_config.codec_pad_id, model.config.talker_config.codec_bos_id]],
+            device=device,
+            dtype=input_id.dtype,
+        )
+    )
+    if speaker_embed is None:
+        codec_input_embedding = torch.cat([codec_prefill_embed, codec_tail_embed], dim=1)
+    else:
+        codec_input_embedding = torch.cat(
+            [codec_prefill_embed, speaker_embed.view(1, 1, -1), codec_tail_embed],
+            dim=1,
+        )
+
+    role_embed = talker.text_projection(talker.get_text_embeddings()(input_id[:, :3]))
+    tag_embed = torch.cat(
+        (
+            tts_pad_embed.expand(-1, codec_input_embedding.shape[1] - 2, -1),
+            tts_bos_embed,
+        ),
+        dim=1,
+    ) + codec_input_embedding[:, :-1]
+    prefill = torch.cat((role_embed, tag_embed), dim=1)
+
+    ref_code = prompt["ref_code"][0] if prompt.get("ref_code") is not None else None
+    if ref_code is not None and prompt["icl_mode"][0]:
+        if ref_id is None:
+            raise ValueError("ref_text is required for teacher ICL conditioning")
+        icl_embed, trailing_text_hidden = model.generate_icl_prompt(
+            text_id=input_id[:, 3:-5],
+            ref_id=ref_id.to(device)[:, 3:-2],
+            ref_code=ref_code.to(device),
+            tts_pad_embed=tts_pad_embed,
+            tts_eos_embed=tts_eos_embed,
+            non_streaming_mode=non_streaming_mode,
+        )
+        return torch.cat([prefill, icl_embed], dim=1), trailing_text_hidden, tts_pad_embed
+
+    prefill = torch.cat(
+        [
+            prefill,
+            talker.text_projection(talker.get_text_embeddings()(input_id[:, 3:4])) + codec_input_embedding[:, -1:],
+        ],
+        dim=1,
+    )
+    if non_streaming_mode:
+        prefill = prefill[:, :-1]
+        text_embed = torch.cat(
+            (
+                talker.text_projection(talker.get_text_embeddings()(input_id[:, 3:-5])),
+                tts_eos_embed,
+            ),
+            dim=1,
+        )
+        text_codec_pad = talker.get_input_embeddings()(
+            torch.tensor(
+                [[model.config.talker_config.codec_pad_id] * text_embed.shape[1]],
+                device=device,
+                dtype=input_id.dtype,
+            )
+        )
+        codec_bos_embed = talker.get_input_embeddings()(
+            torch.tensor(
+                [[model.config.talker_config.codec_bos_id]],
+                device=device,
+                dtype=input_id.dtype,
+            )
+        )
+        prefill = torch.cat([prefill, text_embed + text_codec_pad, tts_pad_embed + codec_bos_embed], dim=1)
+        trailing_text_hidden = tts_pad_embed
+    else:
+        trailing_text_hidden = torch.cat(
+            (
+                talker.text_projection(talker.get_text_embeddings()(input_id[:, 4:-5])),
+                tts_eos_embed,
+            ),
+            dim=1,
+        )
+
+    return prefill, trailing_text_hidden, tts_pad_embed
+
+
+def _codec_frame_embeddings(model, codes: torch.Tensor) -> torch.Tensor:
+    talker = model.talker
+    pieces = [talker.get_input_embeddings()(codes[:, 0])]
     for idx in range(1, model.talker.config.num_code_groups):
-        codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[idx - 1](codec_ids[:, :, idx])
-        codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
-        input_embeddings = input_embeddings + codec_i_embedding
+        pieces.append(talker.code_predictor.get_input_embeddings()[idx - 1](codes[:, idx]))
+    return torch.stack(pieces, dim=0).sum(dim=0)
 
-    codec_loss_mask = codec_0_labels[:, 1:].ne(-100)
+
+def _trailing_steps(trailing_text_hidden: torch.Tensor, tts_pad_embed: torch.Tensor, steps: int) -> torch.Tensor:
+    if trailing_text_hidden.shape[1] >= steps:
+        return trailing_text_hidden[:, :steps, :]
+    pad = tts_pad_embed.expand(-1, steps - trailing_text_hidden.shape[1], -1)
+    return torch.cat([trailing_text_hidden, pad], dim=1)
+
+
+def conditioned_token_logits(
+    tts,
+    sample: dict[str, Any],
+    codes: torch.Tensor,
+    *,
+    x_vector_only_mode: bool,
+    non_streaming_mode: bool,
+) -> TokenLogits:
+    model = tts.model
+    device = next(model.parameters()).device
+    codes = codes.to(device=device, dtype=torch.long)
+    if codes.ndim != 2:
+        raise ValueError(f"codes must be [T, Q], got shape {tuple(codes.shape)}")
+    if codes.shape[1] != model.talker.config.num_code_groups:
+        raise ValueError(f"codes have {codes.shape[1]} codebooks, expected {model.talker.config.num_code_groups}")
+
+    prefill, trailing_text_hidden, tts_pad_embed = build_voice_clone_prefill(
+        tts,
+        sample,
+        x_vector_only_mode=x_vector_only_mode,
+        non_streaming_mode=non_streaming_mode,
+    )
+    frame_text = _trailing_steps(trailing_text_hidden, tts_pad_embed, codes.shape[0])
+    frame_embeds = _codec_frame_embeddings(model, codes).unsqueeze(0) + frame_text
+
+    eos_id = torch.tensor(
+        [[model.config.talker_config.codec_eos_token_id]],
+        device=device,
+        dtype=torch.long,
+    )
+    eos_text = _trailing_steps(trailing_text_hidden, tts_pad_embed, codes.shape[0] + 1)[:, -1:, :]
+    eos_embed = model.talker.get_input_embeddings()(eos_id) + eos_text
+
+    inputs_embeds = torch.cat([prefill, frame_embeds, eos_embed], dim=1)
+    attention_mask = torch.ones(inputs_embeds.shape[:2], device=inputs_embeds.device, dtype=torch.long)
     outputs = model.talker(
-        inputs_embeds=input_embeddings[:, :-1, :],
+        inputs_embeds=inputs_embeds[:, :-1, :],
         attention_mask=attention_mask[:, :-1],
         output_hidden_states=True,
     )
-    codec_0_loss = F.cross_entropy(
-        outputs.logits[codec_loss_mask],
-        codec_0_labels[:, 1:][codec_loss_mask],
-    )
+
+    start = prefill.shape[1]
+    positions = torch.arange(start, start + codes.shape[0], device=device)
+    first_logits = outputs.logits[0, positions - 1, :]
+
     hidden_states = outputs.hidden_states[0][-1]
-    talker_hidden_states = hidden_states[codec_mask[:, :-1]]
-    talker_codec_ids = codec_ids[codec_mask]
-    sub_talker_logits, _ = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
-    sub_talker_labels = talker_codec_ids[:, 1:]
-    sub_talker_loss = F.cross_entropy(
-        sub_talker_logits.reshape(-1, sub_talker_logits.size(-1)),
-        sub_talker_labels.reshape(-1),
-        ignore_index=-100,
-    )
-    loss = codec_0_loss + sub_talker_loss_coef * sub_talker_loss
-    return loss, codec_0_loss.detach(), sub_talker_loss.detach()
+    talker_hidden_states = hidden_states[0, positions, :]
+    sub_logits, _ = model.talker.forward_sub_talker_finetune(codes, talker_hidden_states)
+    return TokenLogits(first_codebook=first_logits, sub_codebooks=sub_logits)
 
 
-def remove_model_files(output_dir: str):
+@torch.no_grad()
+def generate_student_codes(tts, sample: dict[str, Any], args) -> torch.Tensor:
+    was_training = tts.model.training
+    tts.model.eval()
+    try:
+        input_ids, ref_id, prompt = _prompt_for_sample(tts, sample, x_vector_only_mode=True)
+        codes, _ = tts.model.generate(
+            input_ids=[input_ids.to(tts.device)],
+            ref_ids=[ref_id.to(tts.device) if ref_id is not None else None],
+            voice_clone_prompt=prompt,
+            languages=[sample.get("language", "Auto")],
+            non_streaming_mode=args.non_streaming_mode,
+            do_sample=True,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            subtalker_dosample=True,
+            subtalker_top_k=args.subtalker_top_k,
+            subtalker_top_p=args.subtalker_top_p,
+            subtalker_temperature=args.subtalker_temperature,
+            max_new_tokens=args.max_new_tokens,
+        )
+    finally:
+        if was_training:
+            tts.model.train()
+    if not codes:
+        raise RuntimeError("student rollout returned no codes")
+    return codes[0].detach()
+
+
+def token_kl(student_logits: torch.Tensor, teacher_logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    student_logp = F.log_softmax(student_logits / temperature, dim=-1)
+    teacher_p = F.softmax(teacher_logits.detach() / temperature, dim=-1)
+    return F.kl_div(student_logp, teacher_p, reduction="batchmean") * (temperature**2)
+
+
+def token_ce(student_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(student_logits.reshape(-1, student_logits.shape[-1]), labels.reshape(-1))
+
+
+def remove_model_files(output_dir: str) -> None:
     output = Path(output_dir)
     patterns = ["model*.safetensors", "model.safetensors.index.json", "pytorch_model*.bin", "pytorch_model.bin.index.json"]
     for pattern in patterns:
@@ -273,7 +346,7 @@ def remove_model_files(output_dir: str):
             path.unlink()
 
 
-def save_checkpoint(tts, base_model_dir: str, output_dir: str, overwrite: bool = True):
+def save_checkpoint(tts, base_model_dir: str, output_dir: str, overwrite: bool = True) -> None:
     output = Path(output_dir)
     if output.exists():
         if not overwrite:
@@ -281,10 +354,7 @@ def save_checkpoint(tts, base_model_dir: str, output_dir: str, overwrite: bool =
         shutil.rmtree(output)
     shutil.copytree(base_model_dir, output_dir)
     remove_model_files(output_dir)
-    state_dict = {
-        key: value.detach().cpu().contiguous()
-        for key, value in tts.model.state_dict().items()
-    }
+    state_dict = {key: value.detach().cpu().contiguous() for key, value in tts.model.state_dict().items()}
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
     tts.processor.save_pretrained(output_dir)
 
@@ -304,4 +374,3 @@ def format_eta(seconds: float) -> str:
 
 def finish_time(remaining_seconds: float) -> str:
     return (datetime.now() + timedelta(seconds=remaining_seconds)).strftime("%Y-%m-%d %H:%M:%S")
-
