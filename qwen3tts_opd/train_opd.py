@@ -72,10 +72,20 @@ def _device(requested: str) -> torch.device:
 
 
 def _validate_row(row: dict) -> None:
-    if "ref_audio" not in row:
-        raise KeyError("each row must contain ref_audio")
-    if not row.get("ref_text"):
-        raise KeyError("OPD teacher ICL requires ref_text for each row")
+    student_audio = row.get("student_spk_audio", row.get("ref_audio"))
+    teacher_audio = row.get("teacher_ref_audio", row.get("ref_audio"))
+    teacher_text = row.get("teacher_ref_text", row.get("ref_text"))
+    if not student_audio:
+        raise KeyError("each row must contain student_spk_audio (or legacy ref_audio)")
+    if not teacher_audio:
+        raise KeyError("each row must contain teacher_ref_audio (or legacy ref_audio)")
+    if not teacher_text:
+        raise KeyError("OPD teacher ICL requires teacher_ref_text (or legacy ref_text)")
+    target_audio = row.get("target_audio", row.get("audio"))
+    if target_audio and os.path.realpath(target_audio) == os.path.realpath(teacher_audio):
+        raise ValueError("target_audio and teacher_ref_audio must be different")
+    if target_audio and os.path.realpath(target_audio) == os.path.realpath(student_audio):
+        raise ValueError("target_audio and student_spk_audio must be different")
 
 
 def main() -> None:
@@ -100,6 +110,10 @@ def main() -> None:
     if getattr(teacher.model, "speaker_encoder", None) is None:
         raise ValueError("teacher checkpoint must be a Qwen3-TTS Base-compatible checkpoint.")
 
+    for param in student.model.parameters():
+        param.requires_grad_(False)
+    for param in student.model.talker.parameters():
+        param.requires_grad_(True)
     teacher.model.eval()
     for param in teacher.model.parameters():
         param.requires_grad_(False)
@@ -115,7 +129,7 @@ def main() -> None:
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
 
-    optimizer = AdamW(student.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = AdamW(student.model.talker.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     planned_steps = len(data) * args.num_epochs
     if args.max_steps > 0:
         planned_steps = min(planned_steps, args.max_steps)

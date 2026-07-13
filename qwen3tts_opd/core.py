@@ -74,9 +74,18 @@ def load_tts(local_model_dir: str, dtype: torch.dtype, attn_implementation: str,
 
 
 def _prompt_for_sample(tts, sample: dict[str, Any], *, x_vector_only_mode: bool):
+    if x_vector_only_mode:
+        ref_audio = sample.get("student_spk_audio", sample.get("ref_audio"))
+        ref_text = None
+    else:
+        ref_audio = sample.get("teacher_ref_audio", sample.get("ref_audio"))
+        ref_text = sample.get("teacher_ref_text", sample.get("ref_text"))
+    if not ref_audio:
+        field = "student_spk_audio" if x_vector_only_mode else "teacher_ref_audio"
+        raise KeyError(f"sample requires {field} (or legacy ref_audio)")
     prompt_items = tts.create_voice_clone_prompt(
-        ref_audio=[sample["ref_audio"]],
-        ref_text=[sample.get("ref_text")],
+        ref_audio=[ref_audio],
+        ref_text=[ref_text],
         x_vector_only_mode=[x_vector_only_mode],
     )
     prompt = tts._prompt_items_to_voice_clone_prompt(prompt_items)
@@ -354,7 +363,11 @@ def save_checkpoint(tts, base_model_dir: str, output_dir: str, overwrite: bool =
         shutil.rmtree(output)
     shutil.copytree(base_model_dir, output_dir)
     remove_model_files(output_dir)
-    state_dict = {key: value.detach().cpu().contiguous() for key, value in tts.model.state_dict().items()}
+    state_dict = {
+        key: value.detach().cpu().contiguous()
+        for key, value in tts.model.state_dict().items()
+        if not key.startswith("speech_tokenizer.")
+    }
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
     tts.processor.save_pretrained(output_dir)
 

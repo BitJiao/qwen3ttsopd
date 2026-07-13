@@ -1,11 +1,13 @@
 __pycache__/
 *.py[cod]
 .venv/
+.runtime/
 venv/
 .env
 data/
 checkpoints/
 outputs/
+logs/
 *.wav
 *.flac
 *.mp3
@@ -13,4 +15,3 @@ outputs/
 *.pth
 *.ckpt
 *.safetensors
-

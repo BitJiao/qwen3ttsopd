@@ -6,7 +6,7 @@ cd "${ROOT}"
 
 export PYTHONPATH="${ROOT}:${QWEN3_TTS_REPO:-}:${PYTHONPATH:-}"
 
-python -m qwen3tts_opd.train_opd \
+"${PYTHON:-${ROOT}/.venv/bin/python}" -m qwen3opsd.train_opd \
   --student_model_path "${STUDENT_MODEL_PATH:-${MODEL_PATH:?set MODEL_PATH or STUDENT_MODEL_PATH}}" \
   --teacher_model_path "${TEACHER_MODEL_PATH:-${STUDENT_MODEL_PATH:-${MODEL_PATH}}}" \
   --input_jsonl "${INPUT_JSONL:?set INPUT_JSONL}" \

@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwen3tts-opd"
-version = "0.1.0"
-description = "On-policy distillation tools for Qwen3-TTS Base."
+version = "0.2.0"
+description = "Instruction SFT and ICL teacher on-policy distillation for Qwen3-TTS Base."
 requires-python = ">=3.10"
 readme = "README.md"
 
 [tool.setuptools.packages.find]
-include = ["qwen3tts_opd*"]
+include = ["qwen3opsd*", "qwen3tts_opd*"]
