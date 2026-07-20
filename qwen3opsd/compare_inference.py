@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from qwen3opsd.instruction_utils import get_instruction, get_target_text
+from qwen3tts_opd.conditioning import teacher_prompt_items
 
 
 CANDIDATE_SPECS = {
@@ -112,11 +113,10 @@ def generate_candidate(
         **gen_kwargs,
     }
     if candidate == "base_icl":
+        prompt_items = teacher_prompt_items(tts, row)
         return tts.generate_voice_clone(
             **common,
-            ref_audio=row.get("teacher_ref_audio", row.get("ref_audio")),
-            ref_text=row.get("teacher_ref_text", row.get("ref_text")),
-            x_vector_only_mode=False,
+            voice_clone_prompt=prompt_items,
         )
     if candidate in {"student", "vd_teacher"}:
         return tts.generate_voice_design(**common, instruct=get_instruction(row))
@@ -220,6 +220,10 @@ def main() -> None:
                 "language": row.get("language", "Auto"),
                 "target_audio": row.get("target_audio", row.get("audio")),
                 "teacher_ref_audio": row.get("teacher_ref_audio", row.get("ref_audio")),
+                "teacher_ref_codes_path": row.get("teacher_ref_codes_path", row.get("ref_codes_path")),
+                "teacher_ref_spk_emb_path": row.get(
+                    "teacher_ref_spk_emb_path", row.get("ref_spk_emb_path")
+                ),
                 "teacher_ref_text": row.get("teacher_ref_text", row.get("ref_text")),
                 "outputs": {},
                 "_name": _safe_sample_name(sample_id, index),

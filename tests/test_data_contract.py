@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qwen3opsd.data_contract import validate_sft_row
+import numpy as np
+
+from qwen3opsd.data_contract import load_audio_codes, validate_sft_row
 from qwen3opsd.prepare_codes import get_target_audio, load_rows
 
 
@@ -34,6 +36,20 @@ class DataContractTest(unittest.TestCase):
             },
             row_number=1,
         )
+
+    def test_loads_cached_codes_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "codes.npy"
+            np.save(path, np.arange(48).reshape(1, 3, 16))
+            row = {"text": "target", "caption": "warm voice", "codes_path": str(path)}
+            validate_sft_row(row, row_number=1)
+            self.assertEqual(load_audio_codes(row).shape, (3, 16))
+
+    def test_normalizes_transposed_cached_codes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "codes.npy"
+            np.save(path, np.arange(48).reshape(16, 3))
+            self.assertEqual(load_audio_codes({"text": "target", "codes_path": str(path)}).shape, (3, 16))
 
 
 if __name__ == "__main__":

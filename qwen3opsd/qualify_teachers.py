@@ -9,7 +9,7 @@ from statistics import mean
 
 import torch
 
-from qwen3opsd.data_contract import validate_sft_row
+from qwen3opsd.data_contract import load_audio_codes, validate_sft_row
 from qwen3opsd.instruction_utils import get_target_text
 from qwen3tts_opd.core import (
     conditioned_token_logits,
@@ -29,8 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare VoiceDesign student, Base-ICL teacher, and VD teacher NLL.")
     parser.add_argument("--student_model_path", required=True)
     parser.add_argument("--base_teacher_model_path", required=True)
-    parser.add_argument("--vd_teacher_model_path", required=True)
-    parser.add_argument("--input_jsonl", required=True, help="OPD JSONL with target audio_codes [T, 16].")
+    parser.add_argument(
+        "--vd_teacher_model_path",
+        default=None,
+        help="Optional frozen VoiceDesign teacher. Omit it for student-vs-Base qualification.",
+    )
+    parser.add_argument(
+        "--input_jsonl", required=True, help="OPD JSONL with target audio_codes or a codes_path .npy."
+    )
     parser.add_argument("--output_jsonl", default="results/teacher_qualification/scores.jsonl")
     parser.add_argument("--summary_json", default="results/teacher_qualification/summary.json")
     parser.add_argument("--device", default="cuda:0", help="Models are scored sequentially on this device.")
@@ -83,7 +89,7 @@ def score_candidate(
     signature = _model_signature(tts.model)
     scores: list[dict[str, float]] = []
     for index, row in enumerate(rows, start=1):
-        codes = torch.tensor(row["audio_codes"], dtype=torch.long, device=device)
+        codes = torch.as_tensor(load_audio_codes(row, row_number=index), dtype=torch.long, device=device)
         logits = conditioned_token_logits(
             tts,
             row,
@@ -129,16 +135,19 @@ def build_summary(records: list[dict], model_paths: dict[str, str], sub_loss_wei
         "samples": len(records),
         "sub_loss_weight": sub_loss_weight,
         "model_paths": model_paths,
-        "same_student_and_vd_teacher_path": model_paths["student"] == model_paths["vd_teacher"],
     }
+    if "vd_teacher" in model_paths:
+        summary["same_student_and_vd_teacher_path"] = model_paths["student"] == model_paths["vd_teacher"]
     winners = Counter(record["winner"] for record in records)
     summary["winner_counts"] = dict(sorted(winners.items()))
-    for candidate in ("student", "base_icl", "vd_teacher"):
+    for candidate in model_paths:
         summary[candidate] = {
             key: mean(record[candidate][key] for record in records)
             for key in ("codec0_nll", "eos_nll", "first_nll", "sub_nll", "total_nll")
         }
     for candidate in ("base_icl", "vd_teacher"):
+        if candidate not in model_paths:
+            continue
         margins = [record[f"{candidate}_margin"] for record in records]
         summary[f"{candidate}_margin"] = {
             "mean": mean(margins),
@@ -164,8 +173,9 @@ def main() -> None:
     candidates = {
         "student": (args.student_model_path, "voice_design", "voice_design"),
         "base_icl": (args.base_teacher_model_path, "base", "teacher_icl"),
-        "vd_teacher": (args.vd_teacher_model_path, "voice_design", "voice_design"),
     }
+    if args.vd_teacher_model_path:
+        candidates["vd_teacher"] = (args.vd_teacher_model_path, "voice_design", "voice_design")
     all_scores: dict[str, list[dict[str, float]]] = {}
     signatures: dict[str, dict[str, object]] = {}
     for name, (model_path, model_type, conditioning) in candidates.items():
@@ -187,19 +197,18 @@ def main() -> None:
     for index, row in enumerate(rows):
         scores = {name: all_scores[name][index] for name in candidates}
         base_margin = scores["student"]["total_nll"] - scores["base_icl"]["total_nll"]
-        vd_margin = scores["student"]["total_nll"] - scores["vd_teacher"]["total_nll"]
         winner = min(scores, key=lambda name: scores[name]["total_nll"])
-        records.append(
-            {
-                "index": index,
-                "sample_id": row.get("sample_id", index),
-                "text": get_target_text(row),
-                **scores,
-                "base_icl_margin": base_margin,
-                "vd_teacher_margin": vd_margin,
-                "winner": winner,
-            }
-        )
+        record = {
+            "index": index,
+            "sample_id": row.get("sample_id", row.get("key", index)),
+            "text": get_target_text(row),
+            **scores,
+            "base_icl_margin": base_margin,
+            "winner": winner,
+        }
+        if "vd_teacher" in scores:
+            record["vd_teacher_margin"] = scores["student"]["total_nll"] - scores["vd_teacher"]["total_nll"]
+        records.append(record)
 
     output_jsonl = Path(args.output_jsonl)
     summary_json = Path(args.summary_json)

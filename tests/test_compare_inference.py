@@ -10,6 +10,12 @@ class FakeTTS:
     def __init__(self) -> None:
         self.calls = []
 
+    def create_voice_clone_prompt(self, **kwargs):
+        class Prompt:
+            ref_text = kwargs["ref_text"][0]
+
+        return [Prompt()]
+
     def generate_voice_clone(self, **kwargs):
         self.calls.append(("clone", kwargs))
         return [object()], 24000
@@ -36,9 +42,7 @@ class CompareInferenceTest(unittest.TestCase):
         )
         mode, kwargs = tts.calls[0]
         self.assertEqual(mode, "clone")
-        self.assertEqual(kwargs["ref_audio"], "reference.wav")
-        self.assertEqual(kwargs["ref_text"], "reference transcript")
-        self.assertFalse(kwargs["x_vector_only_mode"])
+        self.assertEqual(kwargs["voice_clone_prompt"][0].ref_text, "reference transcript")
 
     def test_both_vd_candidates_use_instruction(self) -> None:
         for candidate in ("student", "vd_teacher"):
