@@ -15,6 +15,8 @@ from torch.optim import AdamW
 from qwen3tts_opd.core import (
     conditioned_token_logits,
     ensure_qwen3_tts_repo_on_path,
+    first_codebook_labels_with_eos,
+    first_codebook_logits_with_eos,
     finish_time,
     format_eta,
     generate_student_codes,
@@ -26,13 +28,13 @@ from qwen3tts_opd.core import (
     token_kl,
     torch_dtype,
 )
-from qwen3tts_opd.instruction_utils import with_formatted_text
+from qwen3tts_opd.instruction_utils import get_target_text
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="On-policy distillation trainer for Qwen3-TTS.")
     parser.add_argument("--student_model_path", "--model_path", dest="student_model_path", required=True)
-    parser.add_argument("--teacher_model_path", default=None)
+    parser.add_argument("--teacher_model_path", required=True)
     parser.add_argument("--input_jsonl", required=True)
     parser.add_argument("--output_dir", default="checkpoints/qwen3_tts_opd")
     parser.add_argument("--device", default="cuda:0")
@@ -48,7 +50,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl_temperature", type=float, default=1.0)
     parser.add_argument("--sub_kl_weight", type=float, default=0.3)
     parser.add_argument("--student_ce_weight", type=float, default=0.05)
-    parser.add_argument("--instruction_template", default="qwen_control", choices=["qwen_control", "plain", "bracket"])
     parser.add_argument("--save_freq", type=int, default=100)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--shuffle", action="store_true")
@@ -73,11 +74,12 @@ def _device(requested: str) -> torch.device:
 
 def _validate_row(row: dict, *, row_number: int | None = None) -> None:
     location = f" {row_number}" if row_number is not None else ""
-    student_audio = row.get("student_spk_audio", row.get("ref_audio"))
+    try:
+        get_target_text(row)
+    except KeyError as exc:
+        raise KeyError(f"OPD row{location} requires text (or target_text)") from exc
     teacher_audio = row.get("teacher_ref_audio", row.get("ref_audio"))
     teacher_text = row.get("teacher_ref_text", row.get("ref_text"))
-    if not student_audio:
-        raise KeyError(f"OPD row{location} requires student_spk_audio (or legacy ref_audio)")
     if not teacher_audio:
         raise KeyError(f"OPD row{location} requires teacher_ref_audio (or legacy ref_audio)")
     if not teacher_text:
@@ -85,8 +87,6 @@ def _validate_row(row: dict, *, row_number: int | None = None) -> None:
     target_audio = row.get("target_audio", row.get("audio"))
     if target_audio and os.path.realpath(target_audio) == os.path.realpath(teacher_audio):
         raise ValueError(f"OPD row{location} has identical target_audio and teacher_ref_audio")
-    if target_audio and os.path.realpath(target_audio) == os.path.realpath(student_audio):
-        raise ValueError(f"OPD row{location} has identical target_audio and student_spk_audio")
 
 
 def main() -> None:
@@ -97,14 +97,14 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    data = [with_formatted_text(row, template=args.instruction_template) for row in load_jsonl(args.input_jsonl)]
+    data = load_jsonl(args.input_jsonl)
     if not data:
         raise ValueError(f"no rows loaded from {args.input_jsonl}")
     for row_number, row in enumerate(data, start=1):
         _validate_row(row, row_number=row_number)
 
     student_dir = resolve_local_model_dir(args.student_model_path)
-    teacher_dir = resolve_local_model_dir(args.teacher_model_path or args.student_model_path)
+    teacher_dir = resolve_local_model_dir(args.teacher_model_path)
     student_device = _device(args.device)
     teacher_device = _device(args.teacher_device or args.device)
     student_dtype = torch_dtype(args.dtype if student_device.type != "cpu" else "fp32")
@@ -112,10 +112,24 @@ def main() -> None:
 
     student = load_tts(student_dir, student_dtype, args.attn_implementation, student_device)
     teacher = load_tts(teacher_dir, teacher_dtype, args.attn_implementation, teacher_device)
-    if getattr(student.model, "speaker_encoder", None) is None:
-        raise ValueError("Qwen3-TTS OPD requires a Base checkpoint with speaker_encoder.")
-    if getattr(teacher.model, "speaker_encoder", None) is None:
-        raise ValueError("teacher checkpoint must be a Qwen3-TTS Base-compatible checkpoint.")
+    if student.model.tts_model_type != "voice_design":
+        raise ValueError(f"OPD student must be VoiceDesign, got {student.model.tts_model_type}")
+    if teacher.model.tts_model_type != "base" or getattr(teacher.model, "speaker_encoder", None) is None:
+        raise ValueError(f"OPD ICL teacher must be Base, got {teacher.model.tts_model_type}")
+    if student.model.talker.config.num_code_groups != teacher.model.talker.config.num_code_groups:
+        raise ValueError("student and teacher use different numbers of codec codebooks")
+    if student.model.talker.config.vocab_size != teacher.model.talker.config.vocab_size:
+        raise ValueError("student and teacher codec vocabularies are incompatible")
+    if (
+        student.model.config.talker_config.codec_eos_token_id
+        != teacher.model.config.talker_config.codec_eos_token_id
+    ):
+        raise ValueError("student and teacher use different codec EOS tokens")
+    if student.model.tokenizer_type != teacher.model.tokenizer_type:
+        raise ValueError(
+            f"student and teacher use different speech tokenizers: "
+            f"{student.model.tokenizer_type} vs {teacher.model.tokenizer_type}"
+        )
 
     for param in student.model.parameters():
         param.requires_grad_(False)
@@ -151,7 +165,7 @@ def main() -> None:
                     teacher,
                     row,
                     student_codes.to(teacher_device),
-                    x_vector_only_mode=False,
+                    conditioning="teacher_icl",
                     non_streaming_mode=args.non_streaming_mode,
                 )
 
@@ -160,13 +174,15 @@ def main() -> None:
                 student,
                 row,
                 student_codes.to(student_device),
-                x_vector_only_mode=True,
+                conditioning="voice_design",
                 non_streaming_mode=args.non_streaming_mode,
             )
 
+            student_first_logits = first_codebook_logits_with_eos(student_logits)
+            teacher_first_logits = first_codebook_logits_with_eos(teacher_logits).to(student_device)
             first_kl = token_kl(
-                student_logits.first_codebook,
-                teacher_logits.first_codebook.to(student_device),
+                student_first_logits,
+                teacher_first_logits,
                 args.kl_temperature,
             )
             sub_kl = token_kl(
@@ -174,7 +190,8 @@ def main() -> None:
                 teacher_logits.sub_codebooks.to(student_device).reshape(-1, teacher_logits.sub_codebooks.shape[-1]),
                 args.kl_temperature,
             )
-            ce = token_ce(student_logits.first_codebook, student_codes.to(student_device)[:, 0])
+            first_labels = first_codebook_labels_with_eos(student.model, student_codes, student_device)
+            ce = token_ce(student_first_logits, first_labels)
             loss = first_kl + args.sub_kl_weight * sub_kl + args.student_ce_weight * ce
 
             optimizer.zero_grad(set_to_none=True)

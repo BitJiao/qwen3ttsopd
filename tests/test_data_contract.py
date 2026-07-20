@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from qwen3opsd.data_contract import validate_sft_row
 from qwen3opsd.prepare_codes import get_target_audio, load_rows
 
 
@@ -23,6 +24,16 @@ class DataContractTest(unittest.TestCase):
             path.write_text(json.dumps([{"target_audio": "target.wav"}]) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(TypeError, "each JSONL line must be an object"):
                 load_rows(path)
+
+    def test_voice_design_sft_does_not_require_enrollment_audio(self) -> None:
+        validate_sft_row(
+            {
+                "text": "target text",
+                "instruction": "bright young female voice",
+                "audio_codes": [[0] * 16],
+            },
+            row_number=1,
+        )
 
 
 if __name__ == "__main__":

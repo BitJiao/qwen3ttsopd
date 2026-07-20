@@ -7,7 +7,7 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Add Qwen3-TTS 12 Hz target audio codes to SFT JSONL.")
-    parser.add_argument("--model-path", required=True, help="Base checkpoint containing speech_tokenizer/.")
+    parser.add_argument("--model-path", required=True, help="VoiceDesign checkpoint containing speech_tokenizer/.")
     parser.add_argument("--input-jsonl", type=Path, required=True)
     parser.add_argument("--output-jsonl", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
