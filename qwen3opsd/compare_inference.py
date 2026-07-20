@@ -11,7 +11,7 @@ from typing import Any
 from qwen3opsd.instruction_utils import get_instruction, get_target_text
 
 
-CANDIDATES = {
+CANDIDATE_SPECS = {
     "student": ("student_model_path", "voice_design"),
     "base_icl": ("base_teacher_model_path", "base"),
     "vd_teacher": ("vd_teacher_model_path", "voice_design"),
@@ -24,7 +24,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--student_model_path", required=True)
     parser.add_argument("--base_teacher_model_path", required=True)
-    parser.add_argument("--vd_teacher_model_path", required=True)
+    parser.add_argument(
+        "--vd_teacher_model_path",
+        default=None,
+        help="Optional frozen VoiceDesign teacher. Omit it for student-vs-Base comparison.",
+    )
     parser.add_argument("--input_jsonl", required=True, help="OPD JSONL; audio_codes are not required.")
     parser.add_argument("--output_dir", default="results/inference_comparison")
     parser.add_argument("--device", default="cuda:0", help="Models are loaded sequentially on this device.")
@@ -45,6 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--non_streaming_mode", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
+
+
+def candidate_specs(args: argparse.Namespace) -> dict[str, tuple[str, str]]:
+    names = ["student", "base_icl"]
+    if args.vd_teacher_model_path:
+        names.append("vd_teacher")
+    return {name: CANDIDATE_SPECS[name] for name in names}
 
 
 def _device(requested: str):
@@ -191,7 +202,8 @@ def main() -> None:
     device = _device(args.device)
     dtype = torch_dtype(args.dtype if device.type != "cpu" else "fp32")
     gen_kwargs = generation_kwargs(args)
-    model_paths = {name: str(getattr(args, fields[0])) for name, fields in CANDIDATES.items()}
+    candidates = candidate_specs(args)
+    model_paths = {name: str(getattr(args, fields[0])) for name, fields in candidates.items()}
     config = _run_config(args, model_paths, gen_kwargs)
     output_dir = Path(args.output_dir)
     _prepare_output(output_dir, config, args.overwrite)
@@ -215,7 +227,7 @@ def main() -> None:
         )
 
     signatures: dict[str, dict[str, Any]] = {}
-    for candidate, (_, expected_type) in CANDIDATES.items():
+    for candidate, (_, expected_type) in candidates.items():
         local_model_dir = resolve_local_model_dir(model_paths[candidate])
         tts = load_tts(local_model_dir, dtype, args.attn_implementation, device)
         actual_type = tts.model.tts_model_type

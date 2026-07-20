@@ -321,7 +321,6 @@ results/teacher_qualification/summary.json
 ```bash
 STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
 BASE_TEACHER_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
-VD_TEACHER_MODEL_PATH=/absolute/path/stronger-VoiceDesign-checkpoint \
 INPUT_JSONL=data/processed/emotiontalk/opd_val.jsonl \
 OUTPUT_DIR=results/inference_comparison \
 DEVICE=cuda:0 \
@@ -329,7 +328,7 @@ MAX_SAMPLES=100 \
 bash scripts/compare_inference.sh
 ```
 
-脚本按顺序加载三个模型，单卡同一时刻只保留一个模型。每条样本的三方推理使用相同 seed 和相同采样参数：
+默认只对比 VoiceDesign student 和 Base-ICL teacher。若还要加入第三个无 ICL 的 VD teacher，再设置 `VD_TEACHER_MODEL_PATH=/absolute/path/stronger-VoiceDesign-checkpoint`。脚本按顺序加载模型，单卡同一时刻只保留一个模型；每条样本的各方推理使用相同 seed 和相同采样参数：
 
 ```text
 student:    VoiceDesign student + instruction/text
@@ -343,7 +342,7 @@ vd_teacher: frozen VoiceDesign teacher + instruction/text（无 ICL）
 results/inference_comparison/
   audio/student/*.wav
   audio/base_icl/*.wav
-  audio/vd_teacher/*.wav
+  audio/vd_teacher/*.wav  # 仅设置 VD_TEACHER_MODEL_PATH 时生成
   manifest.jsonl
   run_config.json
   summary.json

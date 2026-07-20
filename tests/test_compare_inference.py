@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from argparse import Namespace
 
-from qwen3opsd.compare_inference import _safe_sample_name, generate_candidate
+from qwen3opsd.compare_inference import _safe_sample_name, candidate_specs, generate_candidate
 
 
 class FakeTTS:
@@ -56,6 +57,12 @@ class CompareInferenceTest(unittest.TestCase):
 
     def test_sample_name_is_stable_and_path_safe(self) -> None:
         self.assertEqual(_safe_sample_name("scene/a:b", 7), "00007_scene_a_b")
+
+    def test_vd_teacher_is_optional(self) -> None:
+        two_model = candidate_specs(Namespace(vd_teacher_model_path=None))
+        three_model = candidate_specs(Namespace(vd_teacher_model_path="teacher-vd"))
+        self.assertEqual(list(two_model), ["student", "base_icl"])
+        self.assertEqual(list(three_model), ["student", "base_icl", "vd_teacher"])
 
 
 if __name__ == "__main__":
