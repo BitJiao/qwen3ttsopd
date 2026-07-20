@@ -28,13 +28,14 @@ from qwen3tts_opd.core import (
     token_kl,
     torch_dtype,
 )
-from qwen3tts_opd.instruction_utils import get_target_text
+from qwen3tts_opd.teacher_modes import TEACHER_MODES, get_teacher_mode, validate_opd_row
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="On-policy distillation trainer for Qwen3-TTS.")
     parser.add_argument("--student_model_path", "--model_path", dest="student_model_path", required=True)
     parser.add_argument("--teacher_model_path", required=True)
+    parser.add_argument("--teacher_mode", choices=sorted(TEACHER_MODES), default="base_icl")
     parser.add_argument("--input_jsonl", required=True)
     parser.add_argument("--output_dir", default="checkpoints/qwen3_tts_opd")
     parser.add_argument("--device", default="cuda:0")
@@ -72,23 +73,6 @@ def _device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def _validate_row(row: dict, *, row_number: int | None = None) -> None:
-    location = f" {row_number}" if row_number is not None else ""
-    try:
-        get_target_text(row)
-    except KeyError as exc:
-        raise KeyError(f"OPD row{location} requires text (or target_text)") from exc
-    teacher_audio = row.get("teacher_ref_audio", row.get("ref_audio"))
-    teacher_text = row.get("teacher_ref_text", row.get("ref_text"))
-    if not teacher_audio:
-        raise KeyError(f"OPD row{location} requires teacher_ref_audio (or legacy ref_audio)")
-    if not teacher_text:
-        raise KeyError(f"OPD row{location} requires teacher_ref_text (or legacy ref_text) for teacher ICL")
-    target_audio = row.get("target_audio", row.get("audio"))
-    if target_audio and os.path.realpath(target_audio) == os.path.realpath(teacher_audio):
-        raise ValueError(f"OPD row{location} has identical target_audio and teacher_ref_audio")
-
-
 def main() -> None:
     ensure_qwen3_tts_repo_on_path()
     args = parse_args()
@@ -101,7 +85,8 @@ def main() -> None:
     if not data:
         raise ValueError(f"no rows loaded from {args.input_jsonl}")
     for row_number, row in enumerate(data, start=1):
-        _validate_row(row, row_number=row_number)
+        validate_opd_row(row, args.teacher_mode, row_number=row_number)
+    teacher_mode = get_teacher_mode(args.teacher_mode)
 
     student_dir = resolve_local_model_dir(args.student_model_path)
     teacher_dir = resolve_local_model_dir(args.teacher_model_path)
@@ -114,8 +99,13 @@ def main() -> None:
     teacher = load_tts(teacher_dir, teacher_dtype, args.attn_implementation, teacher_device)
     if student.model.tts_model_type != "voice_design":
         raise ValueError(f"OPD student must be VoiceDesign, got {student.model.tts_model_type}")
-    if teacher.model.tts_model_type != "base" or getattr(teacher.model, "speaker_encoder", None) is None:
-        raise ValueError(f"OPD ICL teacher must be Base, got {teacher.model.tts_model_type}")
+    if teacher.model.tts_model_type != teacher_mode.model_type:
+        raise ValueError(
+            f"teacher_mode={teacher_mode.name} requires {teacher_mode.model_type}, "
+            f"got {teacher.model.tts_model_type}"
+        )
+    if teacher_mode.requires_icl and getattr(teacher.model, "speaker_encoder", None) is None:
+        raise ValueError("Base ICL teacher checkpoint has no speaker_encoder")
     if student.model.talker.config.num_code_groups != teacher.model.talker.config.num_code_groups:
         raise ValueError("student and teacher use different numbers of codec codebooks")
     if student.model.talker.config.vocab_size != teacher.model.talker.config.vocab_size:
@@ -165,7 +155,7 @@ def main() -> None:
                     teacher,
                     row,
                     student_codes.to(teacher_device),
-                    conditioning="teacher_icl",
+                    conditioning=teacher_mode.conditioning,
                     non_streaming_mode=args.non_streaming_mode,
                 )
 
@@ -207,6 +197,7 @@ def main() -> None:
                 json.dumps(
                     {
                         "epoch": epoch,
+                        "teacher_mode": teacher_mode.name,
                         "step": global_step,
                         "total_steps": planned_steps,
                         "tokens": int(student_codes.shape[0]),

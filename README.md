@@ -7,7 +7,8 @@
 
 ```text
 student: VoiceDesign(instruction + target text)
-teacher: Base(target text + teacher_ref_audio/text ICL)
+teacher A: Base(target text + teacher_ref_audio/text ICL)
+teacher B: frozen VoiceDesign(instruction + target text, no ICL)
 action:  student 自己采样的 16-codebook codec trajectory
 loss:    first-codebook/EOS KL + sub-codebook KL + small student CE
 ```
@@ -23,7 +24,7 @@ loss:    first-codebook/EOS KL + sub-codebook KL + small student CE
 | EmotionTalk 官方 metadata | 已下载并解析 19,250 条 |
 | 转换逻辑 | VoiceDesign student 不预留 enrollment；需重新运行全量转换审计 |
 | 单元测试 | 覆盖数据转换、conditioning、JSONL 契约和 codec 时间对齐 |
-| 模型级验证 | VoiceDesign student + Base teacher 组合待在 GPU 环境重新 smoke |
+| 模型级验证 | Base-ICL / VD-no-ICL 两种 teacher 组合待在 GPU 环境重新 smoke |
 | 旧 Base-student smoke | 不再代表当前实现，旧 loss 记录已作废 |
 | 真实 EmotionTalk 音频训练 | **未完成：Hugging Face gated access 尚未批准** |
 
@@ -38,10 +39,12 @@ qwen3opsd/
   data_contract.py     VoiceDesign SFT JSONL 结构校验
   sft_dataset.py       VoiceDesign instruction SFT dataset
   train_sft.py         VoiceDesign SFT trainer
+  qualify_teachers.py  student/Base-ICL/VD 三方 target-NLL 比较
   train_opd.py         OPD 入口
   infer.py             SFT/OPD checkpoint 推理
 qwen3tts_opd/
   conditioning.py      VoiceDesign student / Base teacher 条件输入契约
+  teacher_modes.py     Base-ICL / VoiceDesign teacher 模式定义
   core.py              token replay、teacher/student logits、KL、保存
   train_opd.py         OPD 训练实现（保留旧包兼容）
 scripts/
@@ -50,6 +53,7 @@ scripts/
   convert_emotiontalk.sh
   prepare_sft.sh
   train_sft.sh
+  qualify_teachers.sh
   train_opd.sh
 tests/
 ```
@@ -65,6 +69,7 @@ tests/
 - Qwen3-TTS 官方源码 checkout
 - Qwen3-TTS-12Hz-1.7B-VoiceDesign student 权重
 - Qwen3-TTS-12Hz-1.7B-Base teacher 权重（提供 ICL 参考音频条件）
+- 独立的冻结 VoiceDesign teacher checkpoint（无 ICL 候选；不能与 student 完全相同）
 - `ffmpeg`、SoX
 
 ```bash
@@ -239,7 +244,7 @@ OPD 的 `INPUT_JSONL` 不需要预先生成 `audio_codes`，因为 trajectory �
 {"text":"今天很高兴见到你。","instruction":"女性声音清亮自然，语速稍快。","target_audio":"data/audio/target_001.wav","teacher_ref_audio":"data/audio/same_scene_002.wav","teacher_ref_text":"这是一条同场景参考语音的准确转写。","language":"Chinese"}
 ```
 
-OPD 必需字段为 `text`（或 `target_text`）、`teacher_ref_audio` 和 `teacher_ref_text`；`instruction` 允许为空但 VoiceDesign 训练通常应提供，`language` 和仅用于泄漏检查/审计的 `target_audio` 可以省略。student 只读取 instruction/target text，`teacher_ref_audio/text` 仅提供给 Base teacher。
+OPD 始终需要 `text`（或 `target_text`）；`base_icl` 模式和三方 qualification 还需要 `teacher_ref_audio/teacher_ref_text`，单独运行 `voice_design` teacher 模式则不要求这两个 ICL 字段。`instruction` 允许为空但 VoiceDesign 训练通常应提供，`language` 和仅用于泄漏检查/审计的 `target_audio` 可以省略。
 
 ## 5. Instruction SFT
 
@@ -272,13 +277,49 @@ bash scripts/train_sft.sh --overwrite
 - speech tokenizer 冻结，只训练 VoiceDesign talker。
 - checkpoint 保持 `tts_model_type=voice_design`，推理继续调用 `generate_voice_design`。
 
-## 6. ICL Teacher OPD
+## 6. Teacher Qualification 与 OPD
 
-推荐 student 从上一步 VoiceDesign SFT checkpoint 开始。teacher 必须是兼容的 **Base checkpoint**，因为只有 Base 支持 `teacher_ref_audio/text` ICL；不能把同一个 VoiceDesign checkpoint 同时作为 teacher。
+OPD 支持两个冻结 teacher 候选：
+
+- `base_icl`：Base teacher 读取 target text 和 `teacher_ref_audio/text`。
+- `voice_design`：VD teacher 只读取与 student 相同的 instruction/target text，不使用 ICL。
+
+先给 OPD validation 子集补 target `audio_codes`：
+
+```bash
+VOICE_DESIGN_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+INPUT_JSONL=data/processed/emotiontalk/opd_val.jsonl \
+OUTPUT_JSONL=data/processed/emotiontalk/opd_val_with_codes.jsonl \
+bash scripts/prepare_sft.sh
+```
+
+然后顺序加载 student、Base-ICL teacher 和 VD teacher，在相同真实 target codes 上比较 codec-0、EOS、sub-codebook 和总 NLL：
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
+BASE_TEACHER_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
+VD_TEACHER_MODEL_PATH=/absolute/path/stronger-VoiceDesign-checkpoint \
+INPUT_JSONL=data/processed/emotiontalk/opd_val_with_codes.jsonl \
+DEVICE=cuda:0 \
+MAX_SAMPLES=500 \
+bash scripts/qualify_teachers.sh
+```
+
+该工具一次只在设备上保留一个模型，输出：
+
+```text
+results/teacher_qualification/scores.jsonl
+results/teacher_qualification/summary.json
+```
+
+定义 `margin = student_total_nll - teacher_total_nll`。`positive_rate` 越高，teacher 在真实 target 上胜过 student 的样本比例越高。若 `same_student_and_vd_teacher_path=true`，VD teacher 与 student 是同一路径，这个比较通常没有蒸馏价值。NLL qualification 只验证 token 建模能力，正式长跑前仍应补充 WER、风格/情绪匹配和音质生成评测。
+
+使用 Base-ICL teacher 训练：
 
 ```bash
 STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
 TEACHER_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
+TEACHER_MODE=base_icl \
 INPUT_JSONL=data/processed/emotiontalk/opd_train.jsonl \
 OUTPUT_DIR=checkpoints/emotiontalk_opd \
 DEVICE=cuda:0 \
@@ -292,12 +333,25 @@ STUDENT_CE_WEIGHT=0.05 \
 bash scripts/train_opd.sh --shuffle --overwrite
 ```
 
-单张 80 GB GPU 也可以把 `DEVICE` 和 `TEACHER_DEVICE` 都设为 `cuda:0`；两张 GPU 会降低单卡显存压力。
+使用无 ICL 的 VD teacher 时，只替换 teacher checkpoint 和模式：
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
+TEACHER_MODEL_PATH=/absolute/path/stronger-VoiceDesign-checkpoint \
+TEACHER_MODE=voice_design \
+INPUT_JSONL=data/processed/emotiontalk/opd_train.jsonl \
+OUTPUT_DIR=checkpoints/emotiontalk_opd_vd_teacher \
+DEVICE=cuda:0 \
+TEACHER_DEVICE=cuda:1 \
+bash scripts/train_opd.sh --shuffle --overwrite
+```
+
+单张 80 GB GPU 也可以把 `DEVICE` 和 `TEACHER_DEVICE` 都设为 `cuda:0`；两张 GPU 会降低训练时的单卡显存压力。
 
 每一步严格执行：
 
 1. VoiceDesign student 读取独立 instruction 和 target text，采样 codec codes。
-2. Base teacher 读取相同 target text，加上 `teacher_ref_audio/text` ICL。
+2. 所选 teacher 按模式读取 Base ICL 条件或 VD instruction/text 条件。
 3. teacher 和 student 都 replay **同一条 student codes**。
 4. 优化首 codebook KL、子 codebook KL 和小权重 student token CE。
 
@@ -354,11 +408,11 @@ Transformers 版本不匹配。使用 `transformers==4.57.3`。
 
 **模型类型报错**
 
-SFT/student 必须使用 `Qwen3-TTS-12Hz-1.7B-VoiceDesign`，OPD teacher 必须使用 `Qwen3-TTS-12Hz-1.7B-Base`。VoiceDesign 没有 speaker encoder，也不能承担 ICL teacher 角色。
+SFT/student 必须使用 `Qwen3-TTS-12Hz-1.7B-VoiceDesign`。`TEACHER_MODE=base_icl` 要求 Base checkpoint；`TEACHER_MODE=voice_design` 要求 VoiceDesign checkpoint。VoiceDesign 没有 speaker encoder，因此只能作为无 ICL teacher。
 
 **OPD 显存不足**
 
-把 Base teacher 放到另一张 GPU；减小 `MAX_NEW_TOKENS`。当前实现是一条样本一次 on-policy rollout，不使用数据 batch。
+把所选 teacher 放到另一张 GPU；减小 `MAX_NEW_TOKENS`。当前实现是一条样本一次 on-policy rollout，不使用数据 batch。
 
 **某些组被跳过**
 
