@@ -40,6 +40,7 @@ qwen3opsd/
   sft_dataset.py       VoiceDesign instruction SFT dataset
   train_sft.py         VoiceDesign SFT trainer
   qualify_teachers.py  student/Base-ICL/VD 三方 target-NLL 比较
+  compare_inference.py student/Base-ICL/VD 三方生成推理对比
   train_opd.py         OPD 入口
   infer.py             SFT/OPD checkpoint 推理
 qwen3tts_opd/
@@ -54,6 +55,7 @@ scripts/
   prepare_sft.sh
   train_sft.sh
   qualify_teachers.sh
+  compare_inference.sh
   train_opd.sh
 tests/
 ```
@@ -313,6 +315,41 @@ results/teacher_qualification/summary.json
 ```
 
 定义 `margin = student_total_nll - teacher_total_nll`。`positive_rate` 越高，teacher 在真实 target 上胜过 student 的样本比例越高。若 `same_student_and_vd_teacher_path=true`，VD teacher 与 student 是同一路径，这个比较通常没有蒸馏价值。NLL qualification 只验证 token 建模能力，正式长跑前仍应补充 WER、风格/情绪匹配和音质生成评测。
+
+再运行三方生成推理，实际比较可懂度、音质和 instruction/情绪匹配。输入使用原始 `opd_val.jsonl` 即可，不要求 `audio_codes`：
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
+BASE_TEACHER_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
+VD_TEACHER_MODEL_PATH=/absolute/path/stronger-VoiceDesign-checkpoint \
+INPUT_JSONL=data/processed/emotiontalk/opd_val.jsonl \
+OUTPUT_DIR=results/inference_comparison \
+DEVICE=cuda:0 \
+MAX_SAMPLES=100 \
+bash scripts/compare_inference.sh
+```
+
+脚本按顺序加载三个模型，单卡同一时刻只保留一个模型。每条样本的三方推理使用相同 seed 和相同采样参数：
+
+```text
+student:    VoiceDesign student + instruction/text
+base_icl:   Base teacher + teacher_ref_audio/text ICL + target text
+vd_teacher: frozen VoiceDesign teacher + instruction/text（无 ICL）
+```
+
+输出结构：
+
+```text
+results/inference_comparison/
+  audio/student/*.wav
+  audio/base_icl/*.wav
+  audio/vd_teacher/*.wav
+  manifest.jsonl
+  run_config.json
+  summary.json
+```
+
+`manifest.jsonl` 将同一条样本的 target、instruction、ICL reference 和三份生成音频对应起来，可直接交给 ASR/WER、情绪分类器或人工盲听。中断后用完全相同的参数重跑会跳过已有 wav；参数发生变化时必须改 `OUTPUT_DIR` 或显式传 `--overwrite`，避免混合两次实验。
 
 使用 Base-ICL teacher 训练：
 
