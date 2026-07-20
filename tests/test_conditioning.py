@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from qwen3tts_opd.core import _prompt_for_sample
+from qwen3tts_opd.conditioning import teacher_icl_inputs, voice_design_inputs
 
 
 class FakePrompt:
@@ -27,25 +27,34 @@ class FakeTTS:
     def _build_ref_text(self, text):
         return text
 
+    def _build_instruct_text(self, text):
+        return f"instruction:{text}"
+
     def _tokenize_texts(self, texts):
         return [texts[0]]
 
 
 class ConditioningContractTest(unittest.TestCase):
-    def test_student_and_teacher_use_different_references(self) -> None:
+    def test_teacher_uses_privileged_icl_reference(self) -> None:
         sample = {
             "text": "target",
-            "student_spk_audio": "enrollment.wav",
             "teacher_ref_audio": "teacher.wav",
             "teacher_ref_text": "teacher transcript",
         }
         tts = FakeTTS()
-        _prompt_for_sample(tts, sample, x_vector_only_mode=True)
-        _prompt_for_sample(tts, sample, x_vector_only_mode=False)
-        self.assertEqual(tts.calls[0]["ref_audio"], ["enrollment.wav"])
-        self.assertEqual(tts.calls[0]["ref_text"], [None])
-        self.assertEqual(tts.calls[1]["ref_audio"], ["teacher.wav"])
-        self.assertEqual(tts.calls[1]["ref_text"], ["teacher transcript"])
+        teacher_icl_inputs(tts, sample)
+        self.assertEqual(tts.calls[0]["ref_audio"], ["teacher.wav"])
+        self.assertEqual(tts.calls[0]["ref_text"], ["teacher transcript"])
+        self.assertEqual(tts.calls[0]["x_vector_only_mode"], [False])
+
+    def test_student_uses_separate_voice_design_instruction(self) -> None:
+        tts = FakeTTS()
+        input_id, instruct_id = voice_design_inputs(
+            tts,
+            {"text": "target", "instruction": "bright young female voice"},
+        )
+        self.assertEqual(input_id, "target")
+        self.assertEqual(instruct_id, "instruction:bright young female voice")
 
 
 if __name__ == "__main__":

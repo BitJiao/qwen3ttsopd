@@ -165,7 +165,7 @@ def load_utterances(
     return utterances
 
 
-def _base_row(item: Utterance, enrollment: Utterance) -> dict[str, Any]:
+def _base_row(item: Utterance) -> dict[str, Any]:
     return {
         "sample_id": item.sample_id,
         "text": item.text,
@@ -177,8 +177,6 @@ def _base_row(item: Utterance, enrollment: Utterance) -> dict[str, Any]:
         "emotion": item.emotion,
         "audio": str(item.audio),
         "target_audio": str(item.audio),
-        "student_spk_audio": str(enrollment.audio),
-        "ref_audio": str(enrollment.audio),
     }
 
 
@@ -223,15 +221,7 @@ def convert(
     limit: int | None,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    by_speaker_split: dict[tuple[str, str], list[Utterance]] = defaultdict(list)
-    for item in utterances:
-        by_speaker_split[(split_for_scene(item.scene_id), item.speaker_id)].append(item)
-    enrollment = {
-        key: min(items, key=lambda item: (item.scene_id, item.sequence, item.key))
-        for key, items in by_speaker_split.items()
-    }
-    enrollment_ids = {item.sample_id for item in enrollment.values()}
-    targets = [item for item in utterances if item.sample_id not in enrollment_ids]
+    targets = list(utterances)
     targets.sort(key=lambda item: (item.scene_id, item.speaker_id, item.sequence, item.key))
     if limit is not None:
         targets = targets[:limit]
@@ -239,7 +229,7 @@ def convert(
     sft: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in targets:
         split = split_for_scene(item.scene_id)
-        sft[split].append(_base_row(item, enrollment[(split, item.speaker_id)]))
+        sft[split].append(_base_row(item))
 
     grouped: dict[tuple[str, str], list[Utterance]] = defaultdict(list)
     for item in targets:
@@ -252,12 +242,6 @@ def convert(
     for (speaker_id, scene_id), group in sorted(grouped.items()):
         group.sort(key=lambda item: (item.sequence, item.key))
         problem = _group_problem(group, check_audio_hash, hash_cache)
-        if problem is None and check_audio_hash:
-            split = split_for_scene(scene_id)
-            enrollment_audio = enrollment[(split, speaker_id)].audio.resolve()
-            enrollment_hash = cached_sha256(enrollment_audio, hash_cache)
-            if any(hash_cache[item.audio.resolve()] == enrollment_hash for item in group):
-                problem = "target_matches_student_enrollment_content"
         if problem is not None:
             skipped[problem] += 1
             audit.append(
@@ -276,7 +260,7 @@ def convert(
         for index, item in enumerate(group):
             teacher = group[(index + 1) % len(group)]
             split = split_for_scene(item.scene_id)
-            row = _base_row(item, enrollment[(split, item.speaker_id)])
+            row = _base_row(item)
             row.update(
                 {
                     "teacher_ref_audio": str(teacher.audio),
@@ -305,14 +289,14 @@ def convert(
             }
         )
 
-    counts: dict[str, Any] = {"source_rows": len(utterances), "enrollment_rows": len(enrollment)}
+    counts: dict[str, Any] = {"source_rows": len(utterances)}
     for split in ("train", "val", "test"):
         target_counts = Counter(row["target_audio"] for row in opd[split])
         reference_counts = Counter(row["teacher_ref_audio"] for row in opd[split])
         if target_counts != reference_counts or any(count != 1 for count in reference_counts.values()):
             raise AssertionError(f"{split} OPD cycle does not use every target exactly once as teacher reference")
         for row in opd[split]:
-            if row["target_audio"] in {row["teacher_ref_audio"], row["student_spk_audio"]}:
+            if row["target_audio"] == row["teacher_ref_audio"]:
                 raise AssertionError(f"audio leakage in {row['sample_id']}")
         counts[f"sft_{split}"] = write_jsonl(output_dir / f"sft_{split}.jsonl", sft[split])
         counts[f"opd_{split}"] = write_jsonl(output_dir / f"opd_{split}.jsonl", opd[split])
@@ -321,7 +305,6 @@ def convert(
     counts["skipped_groups"] = dict(sorted(skipped.items()))
     counts["opd_reference_cycle_verified"] = True
     counts["target_teacher_audio_leaks"] = 0
-    counts["target_student_audio_leaks"] = 0
     counts["license"] = "CC BY-NC-SA 4.0 (non-commercial)"
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(counts, handle, ensure_ascii=False, indent=2)
