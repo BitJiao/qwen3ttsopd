@@ -15,6 +15,8 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors.torch import save_file
 
+from qwen3tts_opd.alignment import frame_prediction_slice
+
 
 def ensure_qwen3_tts_repo_on_path() -> None:
     env_repo = os.environ.get("QWEN3_TTS_REPO")
@@ -31,8 +33,21 @@ class TokenLogits:
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL at {path}:{line_number}: {exc.msg}") from exc
+            if not isinstance(row, dict):
+                raise TypeError(
+                    f"each JSONL line must be an object, got {type(row).__name__} at {path}:{line_number}"
+                )
+            rows.append(row)
+    return rows
 
 
 def torch_dtype(name: str) -> torch.dtype:
@@ -297,12 +312,10 @@ def conditioned_token_logits(
         output_hidden_states=True,
     )
 
-    start = prefill.shape[1]
-    positions = torch.arange(start, start + codes.shape[0], device=device)
-    first_logits = outputs.logits[0, positions - 1, :]
-
+    prediction_slice = frame_prediction_slice(prefill.shape[1], codes.shape[0])
+    first_logits = outputs.logits[0, prediction_slice, :]
     hidden_states = outputs.hidden_states[0][-1]
-    talker_hidden_states = hidden_states[0, positions, :]
+    talker_hidden_states = hidden_states[0, prediction_slice, :]
     sub_logits, _ = model.talker.forward_sub_talker_finetune(codes, talker_hidden_states)
     return TokenLogits(first_codebook=first_logits, sub_codebooks=sub_logits)
 

@@ -71,21 +71,22 @@ def _device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def _validate_row(row: dict) -> None:
+def _validate_row(row: dict, *, row_number: int | None = None) -> None:
+    location = f" {row_number}" if row_number is not None else ""
     student_audio = row.get("student_spk_audio", row.get("ref_audio"))
     teacher_audio = row.get("teacher_ref_audio", row.get("ref_audio"))
     teacher_text = row.get("teacher_ref_text", row.get("ref_text"))
     if not student_audio:
-        raise KeyError("each row must contain student_spk_audio (or legacy ref_audio)")
+        raise KeyError(f"OPD row{location} requires student_spk_audio (or legacy ref_audio)")
     if not teacher_audio:
-        raise KeyError("each row must contain teacher_ref_audio (or legacy ref_audio)")
+        raise KeyError(f"OPD row{location} requires teacher_ref_audio (or legacy ref_audio)")
     if not teacher_text:
-        raise KeyError("OPD teacher ICL requires teacher_ref_text (or legacy ref_text)")
+        raise KeyError(f"OPD row{location} requires teacher_ref_text (or legacy ref_text) for teacher ICL")
     target_audio = row.get("target_audio", row.get("audio"))
     if target_audio and os.path.realpath(target_audio) == os.path.realpath(teacher_audio):
-        raise ValueError("target_audio and teacher_ref_audio must be different")
+        raise ValueError(f"OPD row{location} has identical target_audio and teacher_ref_audio")
     if target_audio and os.path.realpath(target_audio) == os.path.realpath(student_audio):
-        raise ValueError("target_audio and student_spk_audio must be different")
+        raise ValueError(f"OPD row{location} has identical target_audio and student_spk_audio")
 
 
 def main() -> None:
@@ -95,6 +96,12 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    data = [with_formatted_text(row, template=args.instruction_template) for row in load_jsonl(args.input_jsonl)]
+    if not data:
+        raise ValueError(f"no rows loaded from {args.input_jsonl}")
+    for row_number, row in enumerate(data, start=1):
+        _validate_row(row, row_number=row_number)
 
     student_dir = resolve_local_model_dir(args.student_model_path)
     teacher_dir = resolve_local_model_dir(args.teacher_model_path or args.student_model_path)
@@ -117,12 +124,6 @@ def main() -> None:
     teacher.model.eval()
     for param in teacher.model.parameters():
         param.requires_grad_(False)
-
-    data = [with_formatted_text(row, template=args.instruction_template) for row in load_jsonl(args.input_jsonl)]
-    if not data:
-        raise ValueError(f"no rows loaded from {args.input_jsonl}")
-    for row in data:
-        _validate_row(row)
 
     output_root = Path(args.output_dir)
     if output_root.exists() and args.overwrite:

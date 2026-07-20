@@ -15,7 +15,8 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from qwen3opsd.instruction_utils import with_formatted_text
-from qwen3opsd.sft_dataset import InstructionSFTDataset
+from qwen3opsd.sft_dataset import InstructionSFTDataset, validate_sft_row
+from qwen3tts_opd.alignment import next_token_codec_mask
 from qwen3tts_opd.core import load_jsonl, resolve_local_model_dir, save_checkpoint
 
 
@@ -55,6 +56,11 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    rows = [with_formatted_text(row, template=args.instruction_template) for row in load_jsonl(args.train_jsonl)]
+    if not rows:
+        raise ValueError(f"no rows loaded from {args.train_jsonl}")
+    for row_number, row in enumerate(rows, start=1):
+        validate_sft_row(row, row_number=row_number)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -75,9 +81,6 @@ def main() -> None:
     for parameter in tts.model.talker.parameters():
         parameter.requires_grad_(True)
 
-    rows = [with_formatted_text(row, template=args.instruction_template) for row in load_jsonl(args.train_jsonl)]
-    if not rows:
-        raise ValueError(f"no rows loaded from {args.train_jsonl}")
     dataset = InstructionSFTDataset(rows, tts.processor, tts.model.config)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
     optimizer = AdamW((parameter for parameter in tts.model.talker.parameters() if parameter.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
@@ -127,9 +130,13 @@ def main() -> None:
                 )
                 label_mask = batch["codec_0_labels"][:, 1:].ne(-100)
                 first_loss = F.cross_entropy(outputs.logits[label_mask], batch["codec_0_labels"][:, 1:][label_mask])
-                hidden = outputs.hidden_states[0][-1][batch["codec_mask"][:, :-1]]
+                hidden = outputs.hidden_states[0][-1][next_token_codec_mask(batch["codec_mask"])]
                 target_codes = codec_ids[batch["codec_mask"]]
-                _, sub_loss = raw_model.talker.forward_sub_talker_finetune(target_codes, hidden)
+                sub_logits, _ = raw_model.talker.forward_sub_talker_finetune(target_codes, hidden)
+                sub_loss = F.cross_entropy(
+                    sub_logits.reshape(-1, sub_logits.shape[-1]),
+                    target_codes[:, 1:].reshape(-1),
+                )
                 loss = first_loss + args.sub_loss_weight * sub_loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
