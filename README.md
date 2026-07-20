@@ -22,7 +22,7 @@ loss:    first-codebook KL + sub-codebook KL + small student CE
 |---|---|
 | EmotionTalk 官方 metadata | 已下载并解析 19,250 条 |
 | 全量转换审计 | 1,452 个有效循环组 |
-| 单元测试 | 3/3 通过 |
+| 单元测试 | 覆盖数据转换、conditioning、JSONL 契约和 codec 时间对齐 |
 | Qwen3-TTS Base 加载 | 1.7B Base、16 codebooks，GPU 加载成功 |
 | SFT smoke | 1 step 成功，loss 8.1875 |
 | OPD smoke | 1 step 成功，7 codec frames，loss 6.6875 |
@@ -227,6 +227,33 @@ summary.json
 | `teacher_ref_text` | OPD teacher | teacher reference 的准确转写 |
 
 `ref_audio/ref_text` 仅为兼容旧入口；新代码优先读取语义明确的字段。
+
+### 4.1 训练 JSONL 的准确结构
+
+训练文件是 **JSONL**，不是一个 JSON 数组：每一行必须是一个完整 JSON object，行尾不加逗号，文件外层也不加 `[` / `]`。仓库脚本先 `cd` 到仓库根目录，因此相对音频路径默认相对于仓库根目录；在其他目录直接运行 Python 时建议使用绝对路径。
+
+SFT 提取 codec 前的输入，例如 `sft_train.jsonl`：
+
+```jsonl
+{"text":"今天很高兴见到你。","instruction":"女性声音清亮自然，语速稍快。","target_audio":"data/audio/target_001.wav","student_spk_audio":"data/audio/enrollment.wav","language":"Chinese"}
+{"text":"我们明天再讨论这个问题。","instruction":"语气平静、自然。","target_audio":"data/audio/target_002.wav","student_spk_audio":"data/audio/enrollment.wav","language":"Chinese"}
+```
+
+`target_audio` 是推荐字段；旧数据可以用 `audio` 代替。`student_spk_audio` 必须是独立 enrollment，旧数据可以用 `ref_audio` 代替。运行 `scripts/prepare_sft.sh` 后，每行会保留原字段并增加 `audio_codes`：
+
+```jsonl
+{"text":"今天很高兴见到你。","instruction":"女性声音清亮自然，语速稍快。","target_audio":"data/audio/target_001.wav","student_spk_audio":"data/audio/enrollment.wav","language":"Chinese","audio_codes":[[101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607],[102,203,304,405,506,607,708,809,910,1002,1103,1204,1305,1406,1507,1608]]}
+```
+
+这里 `audio_codes` 的形状必须是 `[T, 16]`：外层长度 `T` 是 12 Hz codec 帧数，每一帧恰好包含 16 个 codebook token。示例只写了两帧用于展示结构，真实音频会有更多帧。`TRAIN_JSONL` 必须指向这个带 `audio_codes` 的文件。
+
+OPD 的 `INPUT_JSONL` 不需要预先生成 `audio_codes`，因为 trajectory 由 student 在线采样。每行推荐结构如下：
+
+```jsonl
+{"text":"今天很高兴见到你。","instruction":"女性声音清亮自然，语速稍快。","target_audio":"data/audio/target_001.wav","student_spk_audio":"data/audio/enrollment.wav","teacher_ref_audio":"data/audio/same_scene_002.wav","teacher_ref_text":"这是一条同场景参考语音的准确转写。","language":"Chinese"}
+```
+
+OPD 必需字段为 `text`（或 `target_text`）、`student_spk_audio`、`teacher_ref_audio` 和 `teacher_ref_text`；`instruction`、`language` 和仅用于泄漏检查/审计的 `target_audio` 可以省略。`student_spk_audio` 应只提供说话人信息，`teacher_ref_audio/text` 才是 teacher 的 ICL 特权条件。
 
 ## 5. Instruction SFT
 

@@ -6,6 +6,22 @@ import torch
 from torch.utils.data import Dataset
 
 
+def validate_sft_row(item: dict[str, Any], *, row_number: int | None = None) -> None:
+    location = f" {row_number}" if row_number is not None else ""
+    student_spk_audio = item.get("student_spk_audio") or item.get("ref_audio")
+    if not student_spk_audio:
+        raise KeyError(f"SFT row{location} requires student_spk_audio (or legacy ref_audio)")
+    if "audio_codes" not in item:
+        raise KeyError(f"SFT row{location} requires audio_codes; run prepare_sft.sh first")
+    audio_codes = torch.as_tensor(item["audio_codes"])
+    if audio_codes.ndim != 2 or audio_codes.shape[1] != 16:
+        raise ValueError(
+            f"SFT row{location} audio_codes must have shape [T, 16], got {tuple(audio_codes.shape)}"
+        )
+    if audio_codes.shape[0] == 0:
+        raise ValueError(f"SFT row{location} audio_codes must contain at least one frame")
+
+
 class InstructionSFTDataset(Dataset):
     """Qwen3-TTS teacher-forcing dataset with per-speaker enrollment audio."""
 
@@ -23,9 +39,7 @@ class InstructionSFTDataset(Dataset):
         text_ids = self.processor(text=text, return_tensors="pt", padding=True)["input_ids"]
         if text_ids.ndim == 1:
             text_ids = text_ids.unsqueeze(0)
-        student_spk_audio = item.get("student_spk_audio", item.get("ref_audio"))
-        if not student_spk_audio:
-            raise KeyError("SFT row requires student_spk_audio (or legacy ref_audio)")
+        student_spk_audio = item.get("student_spk_audio") or item.get("ref_audio")
         return {
             "text_ids": text_ids[:, :-5],
             "audio_codes": torch.tensor(item["audio_codes"], dtype=torch.long),
