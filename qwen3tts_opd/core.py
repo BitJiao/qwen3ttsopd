@@ -15,6 +15,8 @@ import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from safetensors.torch import save_file
 
+from qwen3opsd.instruction_utils import get_instruction, get_target_text
+
 
 def ensure_qwen3_tts_repo_on_path() -> None:
     env_repo = os.environ.get("QWEN3_TTS_REPO")
@@ -28,6 +30,9 @@ ensure_qwen3_tts_repo_on_path()
 class TokenLogits:
     first_codebook: torch.Tensor
     sub_codebooks: torch.Tensor
+    eos_first_codebook: torch.Tensor | None = None
+    codec_0_logits: torch.Tensor | None = None
+    codec_0_labels: torch.Tensor | None = None
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -73,7 +78,13 @@ def load_tts(local_model_dir: str, dtype: torch.dtype, attn_implementation: str,
     return move_tts_to_device(tts, device)
 
 
-def _prompt_for_sample(tts, sample: dict[str, Any], *, x_vector_only_mode: bool):
+def _prompt_for_sample(
+    tts,
+    sample: dict[str, Any],
+    *,
+    x_vector_only_mode: bool,
+    prompt_cache: dict[tuple[str, str | None, bool], Any] | None = None,
+):
     if x_vector_only_mode:
         ref_audio = sample.get("student_spk_audio", sample.get("ref_audio"))
         ref_text = None
@@ -83,20 +94,29 @@ def _prompt_for_sample(tts, sample: dict[str, Any], *, x_vector_only_mode: bool)
     if not ref_audio:
         field = "student_spk_audio" if x_vector_only_mode else "teacher_ref_audio"
         raise KeyError(f"sample requires {field} (or legacy ref_audio)")
-    prompt_items = tts.create_voice_clone_prompt(
-        ref_audio=[ref_audio],
-        ref_text=[ref_text],
-        x_vector_only_mode=[x_vector_only_mode],
-    )
+    cache_key = (str(ref_audio), str(ref_text) if ref_text is not None else None, x_vector_only_mode)
+    prompt_items = prompt_cache.get(cache_key) if prompt_cache is not None else None
+    if prompt_items is None:
+        prompt_items = tts.create_voice_clone_prompt(
+            ref_audio=[ref_audio],
+            ref_text=[ref_text],
+            x_vector_only_mode=[x_vector_only_mode],
+        )
+        if prompt_cache is not None:
+            prompt_cache[cache_key] = prompt_items
     prompt = tts._prompt_items_to_voice_clone_prompt(prompt_items)
-    input_id = tts._tokenize_texts([tts._build_assistant_text(sample["text"])])[0]
+    input_id = tts._tokenize_texts([tts._build_assistant_text(get_target_text(sample))])[0]
+    instruction = get_instruction(sample)
+    instruct_id = None
+    if instruction:
+        instruct_id = tts._tokenize_texts([tts._build_instruct_text(instruction)])[0]
 
     ref_id = None
     ref_text = prompt_items[0].ref_text
     if ref_text is not None and ref_text != "":
         ref_id = tts._tokenize_texts([tts._build_ref_text(ref_text)])[0]
 
-    return input_id, ref_id, prompt
+    return input_id, instruct_id, ref_id, prompt
 
 
 def _language_id(model, language: str | None):
@@ -108,20 +128,63 @@ def _language_id(model, language: str | None):
     return model.config.talker_config.codec_language_id[language_norm]
 
 
+@torch.no_grad()
+def generate_instructed_voice_clone(
+    tts,
+    *,
+    text: str,
+    instruction: str,
+    language: str,
+    voice_clone_prompt: dict[str, Any],
+    non_streaming_mode: bool = True,
+    **generate_kwargs,
+) -> tuple[list[Any], int]:
+    """Generate target text while passing caption through Qwen's independent instruct channel."""
+
+    input_id = tts._tokenize_texts([tts._build_assistant_text(text)])[0]
+    instruct_id = None
+    if instruction:
+        instruct_id = tts._tokenize_texts([tts._build_instruct_text(instruction)])[0]
+    merged_kwargs = tts._merge_generate_kwargs(**generate_kwargs)
+    codes, _ = tts.model.generate(
+        input_ids=[input_id.to(tts.device)],
+        instruct_ids=[instruct_id.to(tts.device) if instruct_id is not None else None],
+        ref_ids=[None],
+        voice_clone_prompt=voice_clone_prompt,
+        languages=[language],
+        non_streaming_mode=non_streaming_mode,
+        **merged_kwargs,
+    )
+    wavs, sample_rate = tts.model.speech_tokenizer.decode(
+        [{"audio_codes": item} for item in codes]
+    )
+    return wavs, sample_rate
+
+
 def build_voice_clone_prefill(
     tts,
     sample: dict[str, Any],
     *,
     x_vector_only_mode: bool,
     non_streaming_mode: bool,
+    prompt_cache: dict[tuple[str, str | None, bool], Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build the same voice-clone prefill embeddings used by Qwen3-TTS generate()."""
 
     model = tts.model
     talker = model.talker
     device = next(model.parameters()).device
-    input_id, ref_id, prompt = _prompt_for_sample(tts, sample, x_vector_only_mode=x_vector_only_mode)
+    input_id, instruct_id, ref_id, prompt = _prompt_for_sample(
+        tts,
+        sample,
+        x_vector_only_mode=x_vector_only_mode,
+        prompt_cache=prompt_cache,
+    )
     input_id = input_id.to(device)
+    instruct_prefix = None
+    if instruct_id is not None:
+        instruct_id = instruct_id.to(device)
+        instruct_prefix = talker.text_projection(talker.get_text_embeddings()(instruct_id))
 
     voice_clone_spk_embeds = model.generate_speaker_prompt(prompt)
     speaker_embed = None
@@ -195,7 +258,10 @@ def build_voice_clone_prefill(
             tts_eos_embed=tts_eos_embed,
             non_streaming_mode=non_streaming_mode,
         )
-        return torch.cat([prefill, icl_embed], dim=1), trailing_text_hidden, tts_pad_embed
+        pieces = [prefill, icl_embed]
+        if instruct_prefix is not None:
+            pieces.insert(0, instruct_prefix)
+        return torch.cat(pieces, dim=1), trailing_text_hidden, tts_pad_embed
 
     prefill = torch.cat(
         [
@@ -238,7 +304,131 @@ def build_voice_clone_prefill(
             dim=1,
         )
 
+    if instruct_prefix is not None:
+        prefill = torch.cat([instruct_prefix, prefill], dim=1)
     return prefill, trailing_text_hidden, tts_pad_embed
+
+
+def build_voice_design_prefill(
+    tts,
+    sample: dict[str, Any],
+    *,
+    non_streaming_mode: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the text+caption prefill used by VoiceDesign generate()."""
+
+    model = tts.model
+    if model.tts_model_type != "voice_design":
+        raise ValueError("VoiceDesign replay requires a voice_design checkpoint")
+    talker = model.talker
+    device = next(model.parameters()).device
+    input_id = tts._tokenize_texts(
+        [tts._build_assistant_text(get_target_text(sample))]
+    )[0].to(device)
+    instruction = get_instruction(sample)
+    if not instruction:
+        raise ValueError("VoiceDesign replay requires a non-empty caption/instruction")
+    instruct_id = tts._tokenize_texts(
+        [tts._build_instruct_text(instruction)]
+    )[0].to(device)
+    instruct_prefix = talker.text_projection(
+        talker.get_text_embeddings()(instruct_id)
+    )
+
+    language_id = _language_id(model, sample.get("language", "Auto"))
+    tts_bos_embed, tts_eos_embed, tts_pad_embed = talker.text_projection(
+        talker.get_text_embeddings()(
+            torch.tensor(
+                [[model.config.tts_bos_token_id, model.config.tts_eos_token_id, model.config.tts_pad_token_id]],
+                device=device,
+                dtype=input_id.dtype,
+            )
+        )
+    ).chunk(3, dim=1)
+
+    if language_id is None:
+        codec_prefill = [[
+            model.config.talker_config.codec_nothink_id,
+            model.config.talker_config.codec_think_bos_id,
+            model.config.talker_config.codec_think_eos_id,
+        ]]
+    else:
+        codec_prefill = [[
+            model.config.talker_config.codec_think_id,
+            model.config.talker_config.codec_think_bos_id,
+            language_id,
+            model.config.talker_config.codec_think_eos_id,
+        ]]
+    codec_input_embedding = torch.cat(
+        [
+            talker.get_input_embeddings()(
+                torch.tensor(codec_prefill, device=device, dtype=input_id.dtype)
+            ),
+            talker.get_input_embeddings()(
+                torch.tensor(
+                    [[model.config.talker_config.codec_pad_id, model.config.talker_config.codec_bos_id]],
+                    device=device,
+                    dtype=input_id.dtype,
+                )
+            ),
+        ],
+        dim=1,
+    )
+
+    role_embed = talker.text_projection(talker.get_text_embeddings()(input_id[:, :3]))
+    tag_embed = torch.cat(
+        (
+            tts_pad_embed.expand(-1, codec_input_embedding.shape[1] - 2, -1),
+            tts_bos_embed,
+        ),
+        dim=1,
+    ) + codec_input_embedding[:, :-1]
+    prefill = torch.cat((role_embed, tag_embed), dim=1)
+    prefill = torch.cat(
+        [
+            prefill,
+            talker.text_projection(talker.get_text_embeddings()(input_id[:, 3:4]))
+            + codec_input_embedding[:, -1:],
+        ],
+        dim=1,
+    )
+    if non_streaming_mode:
+        prefill = prefill[:, :-1]
+        text_embed = torch.cat(
+            (
+                talker.text_projection(talker.get_text_embeddings()(input_id[:, 3:-5])),
+                tts_eos_embed,
+            ),
+            dim=1,
+        )
+        text_codec_pad = talker.get_input_embeddings()(
+            torch.tensor(
+                [[model.config.talker_config.codec_pad_id] * text_embed.shape[1]],
+                device=device,
+                dtype=input_id.dtype,
+            )
+        )
+        codec_bos_embed = talker.get_input_embeddings()(
+            torch.tensor(
+                [[model.config.talker_config.codec_bos_id]],
+                device=device,
+                dtype=input_id.dtype,
+            )
+        )
+        prefill = torch.cat(
+            [prefill, text_embed + text_codec_pad, tts_pad_embed + codec_bos_embed],
+            dim=1,
+        )
+        trailing_text_hidden = tts_pad_embed
+    else:
+        trailing_text_hidden = torch.cat(
+            (
+                talker.text_projection(talker.get_text_embeddings()(input_id[:, 4:-5])),
+                tts_eos_embed,
+            ),
+            dim=1,
+        )
+    return torch.cat([instruct_prefix, prefill], dim=1), trailing_text_hidden, tts_pad_embed
 
 
 def _codec_frame_embeddings(model, codes: torch.Tensor) -> torch.Tensor:
@@ -256,6 +446,68 @@ def _trailing_steps(trailing_text_hidden: torch.Tensor, tts_pad_embed: torch.Ten
     return torch.cat([trailing_text_hidden, pad], dim=1)
 
 
+def _replay_token_logits(
+    model,
+    codes: torch.Tensor,
+    prefill: torch.Tensor,
+    trailing_text_hidden: torch.Tensor,
+    tts_pad_embed: torch.Tensor,
+) -> TokenLogits:
+    device = codes.device
+    frame_text = _trailing_steps(trailing_text_hidden, tts_pad_embed, codes.shape[0])
+    frame_embeds = _codec_frame_embeddings(model, codes).unsqueeze(0) + frame_text
+
+    eos_id = torch.tensor(
+        [[model.config.talker_config.codec_eos_token_id]],
+        device=device,
+        dtype=torch.long,
+    )
+    eos_text = _trailing_steps(trailing_text_hidden, tts_pad_embed, codes.shape[0] + 1)[:, -1:, :]
+    eos_embed = model.talker.get_input_embeddings()(eos_id) + eos_text
+
+    inputs_embeds = torch.cat([prefill, frame_embeds, eos_embed], dim=1)
+    attention_mask = torch.ones(
+        inputs_embeds.shape[:2], device=inputs_embeds.device, dtype=torch.long
+    )
+
+    start = prefill.shape[1]
+    codec_0_labels = torch.full(
+        inputs_embeds.shape[:2],
+        -100,
+        device=device,
+        dtype=torch.long,
+    )
+    codec_0_labels[0, start : start + codes.shape[0]] = codes[:, 0]
+    codec_0_labels[0, start + codes.shape[0]] = eos_id[0, 0]
+
+    codec_mask = torch.zeros_like(codec_0_labels, dtype=torch.bool)
+    codec_mask[0, start : start + codes.shape[0]] = True
+    outputs = model.talker(
+        inputs_embeds=inputs_embeds[:, :-1, :],
+        attention_mask=attention_mask[:, :-1],
+        output_hidden_states=True,
+    )
+
+    shifted_labels = codec_0_labels[:, 1:]
+    codec_loss_mask = shifted_labels.ne(-100)
+    codec_0_logits = outputs.logits[codec_loss_mask]
+    codec_0_targets = shifted_labels[codec_loss_mask]
+    first_logits = codec_0_logits[:-1]
+    eos_logits = codec_0_logits[-1:]
+
+    hidden_states = outputs.hidden_states[0][-1]
+    target_codec_mask = codec_mask[:, 1:]
+    talker_hidden_states = hidden_states[target_codec_mask]
+    sub_logits, _ = model.talker.forward_sub_talker_finetune(codes, talker_hidden_states)
+    return TokenLogits(
+        first_codebook=first_logits,
+        sub_codebooks=sub_logits,
+        eos_first_codebook=eos_logits,
+        codec_0_logits=codec_0_logits,
+        codec_0_labels=codec_0_targets,
+    )
+
+
 def conditioned_token_logits(
     tts,
     sample: dict[str, Any],
@@ -263,6 +515,7 @@ def conditioned_token_logits(
     *,
     x_vector_only_mode: bool,
     non_streaming_mode: bool,
+    prompt_cache: dict[tuple[str, str | None, bool], Any] | None = None,
 ) -> TokenLogits:
     model = tts.model
     device = next(model.parameters()).device
@@ -277,34 +530,37 @@ def conditioned_token_logits(
         sample,
         x_vector_only_mode=x_vector_only_mode,
         non_streaming_mode=non_streaming_mode,
+        prompt_cache=prompt_cache,
     )
-    frame_text = _trailing_steps(trailing_text_hidden, tts_pad_embed, codes.shape[0])
-    frame_embeds = _codec_frame_embeddings(model, codes).unsqueeze(0) + frame_text
-
-    eos_id = torch.tensor(
-        [[model.config.talker_config.codec_eos_token_id]],
-        device=device,
-        dtype=torch.long,
-    )
-    eos_text = _trailing_steps(trailing_text_hidden, tts_pad_embed, codes.shape[0] + 1)[:, -1:, :]
-    eos_embed = model.talker.get_input_embeddings()(eos_id) + eos_text
-
-    inputs_embeds = torch.cat([prefill, frame_embeds, eos_embed], dim=1)
-    attention_mask = torch.ones(inputs_embeds.shape[:2], device=inputs_embeds.device, dtype=torch.long)
-    outputs = model.talker(
-        inputs_embeds=inputs_embeds[:, :-1, :],
-        attention_mask=attention_mask[:, :-1],
-        output_hidden_states=True,
+    return _replay_token_logits(
+        model, codes, prefill, trailing_text_hidden, tts_pad_embed
     )
 
-    start = prefill.shape[1]
-    positions = torch.arange(start, start + codes.shape[0], device=device)
-    first_logits = outputs.logits[0, positions - 1, :]
 
-    hidden_states = outputs.hidden_states[0][-1]
-    talker_hidden_states = hidden_states[0, positions, :]
-    sub_logits, _ = model.talker.forward_sub_talker_finetune(codes, talker_hidden_states)
-    return TokenLogits(first_codebook=first_logits, sub_codebooks=sub_logits)
+def voice_design_token_logits(
+    tts,
+    sample: dict[str, Any],
+    codes: torch.Tensor,
+    *,
+    non_streaming_mode: bool,
+) -> TokenLogits:
+    """Teacher-force codec frames through VoiceDesign with text+caption only."""
+
+    model = tts.model
+    device = next(model.parameters()).device
+    codes = codes.to(device=device, dtype=torch.long)
+    if codes.ndim != 2:
+        raise ValueError(f"codes must be [T, Q], got shape {tuple(codes.shape)}")
+    if codes.shape[1] != model.talker.config.num_code_groups:
+        raise ValueError(
+            f"codes have {codes.shape[1]} codebooks, expected {model.talker.config.num_code_groups}"
+        )
+    prefill, trailing_text_hidden, tts_pad_embed = build_voice_design_prefill(
+        tts, sample, non_streaming_mode=non_streaming_mode
+    )
+    return _replay_token_logits(
+        model, codes, prefill, trailing_text_hidden, tts_pad_embed
+    )
 
 
 @torch.no_grad()
@@ -312,9 +568,12 @@ def generate_student_codes(tts, sample: dict[str, Any], args) -> torch.Tensor:
     was_training = tts.model.training
     tts.model.eval()
     try:
-        input_ids, ref_id, prompt = _prompt_for_sample(tts, sample, x_vector_only_mode=True)
+        input_ids, instruct_id, ref_id, prompt = _prompt_for_sample(
+            tts, sample, x_vector_only_mode=True
+        )
         codes, _ = tts.model.generate(
             input_ids=[input_ids.to(tts.device)],
+            instruct_ids=[instruct_id.to(tts.device) if instruct_id is not None else None],
             ref_ids=[ref_id.to(tts.device) if ref_id is not None else None],
             voice_clone_prompt=prompt,
             languages=[sample.get("language", "Auto")],

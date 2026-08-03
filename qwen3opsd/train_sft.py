@@ -6,7 +6,6 @@ import random
 import shutil
 from pathlib import Path
 
-import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -14,9 +13,8 @@ from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from qwen3opsd.instruction_utils import with_formatted_text
 from qwen3opsd.sft_dataset import InstructionSFTDataset
-from qwen3tts_opd.core import load_jsonl, resolve_local_model_dir, save_checkpoint
+from qwen3tts_opd.core import conditioned_token_logits, load_jsonl, resolve_local_model_dir, save_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,17 +33,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-freq", type=int, default=500)
     parser.add_argument("--mixed-precision", choices=["no", "fp16", "bf16"], default="bf16")
     parser.add_argument("--attn-implementation", default="sdpa")
-    parser.add_argument("--instruction-template", choices=["qwen_control", "plain", "bracket"], default="qwen_control")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
-
-
-def _speaker_embedding(model, path: str, cache: dict[str, torch.Tensor]) -> torch.Tensor:
-    if path not in cache:
-        audio, _ = librosa.load(path, sr=model.speaker_encoder_sample_rate, mono=True)
-        cache[path] = model.extract_speaker_embedding(audio.astype(np.float32), model.speaker_encoder_sample_rate).detach().cpu()
-    return cache[path].to(device=model.device, dtype=model.dtype)
 
 
 def main() -> None:
@@ -75,23 +65,22 @@ def main() -> None:
     for parameter in tts.model.talker.parameters():
         parameter.requires_grad_(True)
 
-    rows = [with_formatted_text(row, template=args.instruction_template) for row in load_jsonl(args.train_jsonl)]
+    rows = load_jsonl(args.train_jsonl)
     if not rows:
         raise ValueError(f"no rows loaded from {args.train_jsonl}")
-    dataset = InstructionSFTDataset(rows, tts.processor, tts.model.config)
+    dataset = InstructionSFTDataset(rows)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
     optimizer = AdamW((parameter for parameter in tts.model.talker.parameters() if parameter.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     model, optimizer, dataloader = accelerator.prepare(tts.model, optimizer, dataloader)
     tts.model = model
     tts.device = accelerator.device
-    raw_model = accelerator.unwrap_model(model)
     output_dir = Path(args.output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
         if not args.overwrite:
             raise FileExistsError(f"output directory is not empty: {output_dir}; pass --overwrite")
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    speaker_cache: dict[str, torch.Tensor] = {}
+    prompt_cache: dict[tuple[str, str | None, bool], object] = {}
     global_step = 0
 
     def save(name: str) -> None:
@@ -106,30 +95,25 @@ def main() -> None:
     for epoch in range(args.num_epochs):
         for batch in dataloader:
             with accelerator.accumulate(model):
-                input_ids = batch["input_ids"]
-                codec_ids = batch["codec_ids"]
-                text_embedding = raw_model.talker.text_projection(raw_model.talker.get_text_embeddings()(input_ids[:, :, 0]))
-                text_embedding = text_embedding * batch["text_embedding_mask"]
-                codec_embedding = raw_model.talker.get_input_embeddings()(input_ids[:, :, 1])
-                codec_embedding = codec_embedding * batch["codec_embedding_mask"]
-                speaker_embeddings = torch.stack(
-                    [_speaker_embedding(raw_model, path, speaker_cache) for path in batch["student_spk_audio"]]
-                )
-                codec_embedding[:, 6, :] = speaker_embeddings
-                input_embeddings = text_embedding + codec_embedding
-                for index in range(1, raw_model.talker.config.num_code_groups):
-                    sub_embedding = raw_model.talker.code_predictor.get_input_embeddings()[index - 1](codec_ids[:, :, index])
-                    input_embeddings = input_embeddings + sub_embedding * batch["codec_mask"].unsqueeze(-1)
-                outputs = raw_model.talker(
-                    inputs_embeds=input_embeddings[:, :-1],
-                    attention_mask=batch["attention_mask"][:, :-1],
-                    output_hidden_states=True,
-                )
-                label_mask = batch["codec_0_labels"][:, 1:].ne(-100)
-                first_loss = F.cross_entropy(outputs.logits[label_mask], batch["codec_0_labels"][:, 1:][label_mask])
-                hidden = outputs.hidden_states[0][-1][batch["codec_mask"][:, :-1]]
-                target_codes = codec_ids[batch["codec_mask"]]
-                _, sub_loss = raw_model.talker.forward_sub_talker_finetune(target_codes, hidden)
+                first_losses = []
+                sub_losses = []
+                for sample, target_codes in zip(batch["samples"], batch["audio_codes"]):
+                    target_codes = target_codes.to(accelerator.device)
+                    logits = conditioned_token_logits(
+                        tts,
+                        sample,
+                        target_codes,
+                        x_vector_only_mode=True,
+                        non_streaming_mode=True,
+                        prompt_cache=prompt_cache,
+                    )
+                    first_losses.append(F.cross_entropy(logits.first_codebook, target_codes[:, 0]))
+                    sub_losses.append(F.cross_entropy(
+                        logits.sub_codebooks.reshape(-1, logits.sub_codebooks.shape[-1]),
+                        target_codes[:, 1:].reshape(-1),
+                    ))
+                first_loss = torch.stack(first_losses).mean()
+                sub_loss = torch.stack(sub_losses).mean()
                 loss = first_loss + args.sub_loss_weight * sub_loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

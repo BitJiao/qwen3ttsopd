@@ -16,25 +16,26 @@ loss:    first-codebook KL + sub-codebook KL + small student CE
 
 ## 当前验证状态
 
-截至 2026-07-13：
+截至 2026-08-03：
 
 | 项目 | 结果 |
 |---|---|
-| EmotionTalk 官方 metadata | 已下载并解析 19,250 条 |
+| EmotionTalk 数据 | gated 音频已下载，19,250 条 metadata 已全量转换 |
 | 全量转换审计 | 1,452 个有效循环组 |
-| 单元测试 | 3/3 通过 |
+| 单元测试 | 22/22 通过 |
 | Qwen3-TTS Base 加载 | 1.7B Base、16 codebooks，GPU 加载成功 |
-| SFT smoke | 1 step 成功，loss 8.1875 |
-| OPD smoke | 1 step 成功，7 codec frames，loss 6.6875 |
-| 真实 EmotionTalk 音频训练 | **未完成：Hugging Face gated access 尚未批准** |
+| Caption SFT | 3 epochs、5,775 optimizer steps 已完成 |
+| Caption OPD | 3,222 / 15,134 samples；最近 checkpoint 为 `step_3000`，需在新服务器续跑 |
+| 旧版 OPD 流程 | 15,134 / 15,134 samples 已完成，仅作历史对照 |
 
-模型级 smoke test 使用本机一段真实中文说话人音频切出的四个互不相同片段，只用于验证代码、梯度和 checkpoint，不是 EmotionTalk 训练结果。`BAAI/Emotiontalk` 的 `Audio.tar` 为 gated 文件；必须先由数据使用者在网页接受 CC BY-NC-SA 4.0 条款。
+`BAAI/Emotiontalk` 的 `Audio.tar` 是 gated 文件。即使本机已有数据，另一台服务器仍必须使用获授权的 Hugging Face 账号下载，并接受 CC BY-NC-SA 4.0 条款；仓库中的 portable manifests 不绕过该授权。
 
 ## 目录结构
 
 ```text
 qwen3opsd/
   emotiontalk.py       EmotionTalk 转换、循环配对和审计
+  portable_manifest.py 跨服务器导出/物化相对音频路径
   prepare_codes.py     提取 Qwen3-TTS 12 Hz target codec
   sft_dataset.py       多说话人 instruction SFT dataset/collator
   train_sft.py         Base-compatible SFT trainer
@@ -53,7 +54,7 @@ scripts/
 tests/
 ```
 
-数据、checkpoint、WAV 和 Hugging Face token 均由 `.gitignore` 排除，不会推送到 GitHub。
+原始数据、checkpoint、WAV、预计算 codec 和 Hugging Face token 均由 `.gitignore` 排除，不会推送到 GitHub。仓库中的 `dataset_manifests/emotiontalk/` 保存可迁移的相对路径清单；完整数据盘点见 [`docs/EMOTION_DATA_INVENTORY.md`](docs/EMOTION_DATA_INVENTORY.md)。
 
 ## 1. 环境
 
@@ -228,6 +229,39 @@ summary.json
 
 `ref_audio/ref_text` 仅为兼容旧入口；新代码优先读取语义明确的字段。
 
+### 从 GitHub manifest 在另一台服务器恢复
+
+仓库已经包含当前实验使用的 SFT/OPD split 和 cycle 配对，不需要在每台服务器重新生成随机切分。下载 gated 音频后执行：
+
+```bash
+python -m qwen3opsd.portable_manifest materialize \
+  --input-dir dataset_manifests/emotiontalk \
+  --output-dir data/processed/emotiontalk \
+  --audio-root data/raw/emotiontalk/extracted \
+  --check-audio
+```
+
+如果目标目录已存在且确认需要替换对应 manifest，显式增加 `--overwrite`。本机重新导出 portable manifests 的命令是：
+
+```bash
+python -m qwen3opsd.portable_manifest export \
+  --input-dir data/processed/emotiontalk \
+  --output-dir dataset_manifests/emotiontalk \
+  --audio-root data/raw/emotiontalk/extracted \
+  --overwrite
+```
+
+`sft_train_with_codes.jsonl` 不上传：它约 90 MB，而且 codec 取决于目标服务器实际使用的 Qwen tokenizer/checkpoint。materialize 后按下一节运行 `scripts/prepare_sft.sh` 即可重建。
+
+模型权重也不适合进入 GitHub：单个 `model.safetensors` 约 3.85 GB。要从现有 caption OPD 进度续跑，需通过 `rsync`、共享存储或私有模型仓库另行传输以下两个目录：
+
+```text
+checkpoints/emotiontalk_sft_caption/final/
+checkpoints/emotiontalk_opd_caption/step_3000/
+```
+
+只传 GitHub 仓库时，可以在新服务器重新完成 SFT，再从头运行 OPD。
+
 ## 5. Instruction SFT
 
 先提取 target audio codes：
@@ -244,7 +278,7 @@ bash scripts/prepare_sft.sh
 ```bash
 MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
 TRAIN_JSONL=data/processed/emotiontalk/sft_train_with_codes.jsonl \
-OUTPUT_DIR=checkpoints/emotiontalk_sft \
+OUTPUT_DIR=checkpoints/emotiontalk_sft_caption \
 BATCH_SIZE=1 \
 GRAD_ACCUM_STEPS=8 \
 NUM_EPOCHS=3 \
@@ -264,10 +298,10 @@ bash scripts/train_sft.sh --overwrite
 推荐 student 从 SFT checkpoint 开始。teacher 可以使用同一 SFT checkpoint 的冻结副本，使两边权重相同、只有 privileged conditioning 不同；也可以指定原始或更强的兼容 Base checkpoint。
 
 ```bash
-STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
-TEACHER_MODEL_PATH=checkpoints/emotiontalk_sft/final \
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft_caption/final \
+TEACHER_MODEL_PATH=checkpoints/emotiontalk_sft_caption/final \
 INPUT_JSONL=data/processed/emotiontalk/opd_train.jsonl \
-OUTPUT_DIR=checkpoints/emotiontalk_opd \
+OUTPUT_DIR=checkpoints/emotiontalk_opd_caption \
 DEVICE=cuda:0 \
 TEACHER_DEVICE=cuda:1 \
 NUM_EPOCHS=1 \
@@ -277,6 +311,20 @@ KL_TEMPERATURE=1.0 \
 SUB_KL_WEIGHT=0.3 \
 STUDENT_CE_WEIGHT=0.05 \
 bash scripts/train_opd.sh --shuffle --overwrite
+```
+
+从已有的 `step_N` 中断点继续时，不要传 `--overwrite`。训练器会从目录名恢复全局步数，按相同 seed 重建 shuffle，并跳过已经完成的数据行。旧 checkpoint 没有保存 Adam 状态，因此第一次续跑会保留模型权重但重新初始化优化器动量。
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft_caption/final \
+TEACHER_MODEL_PATH=checkpoints/emotiontalk_sft_caption/final \
+INPUT_JSONL=data/processed/emotiontalk/opd_train.jsonl \
+OUTPUT_DIR=checkpoints/emotiontalk_opd_caption \
+DEVICE=cuda:0 \
+TEACHER_DEVICE=cuda:1 \
+NUM_EPOCHS=1 \
+bash scripts/train_opd.sh --shuffle \
+  --resume-from-checkpoint checkpoints/emotiontalk_opd_caption/step_3000
 ```
 
 单张 80 GB GPU 也可以把 `DEVICE` 和 `TEACHER_DEVICE` 都设为 `cuda:0`；两张 GPU 会降低单卡显存压力。
@@ -294,7 +342,7 @@ SFT 和 OPD 输出仍是 Base checkpoint，推理时继续提供 enrollment：
 
 ```bash
 python -m qwen3opsd.infer \
-  --model-path checkpoints/emotiontalk_opd/final \
+  --model-path checkpoints/emotiontalk_opd_caption/final \
   --student-spk-audio /absolute/path/enrollment.wav \
   --instruction "女性声音清亮自然，语速稍快，语气轻松。" \
   --text "今天很高兴见到你。" \
@@ -302,16 +350,77 @@ python -m qwen3opsd.infer \
   --device cuda:0
 ```
 
-训练和推理统一使用：
+训练和推理必须使用 Qwen 的独立 caption/instruct 通道：
 
 ```text
-Instruction: <caption>
-Text: <transcript>
+instruct_ids: <|im_start|>user\n<caption><|im_end|>\n
+input_ids:    <|im_start|>assistant\n<transcript><|im_end|>\n<|im_start|>assistant\n
 ```
 
-不要在训练后擅自更换模板，否则 instruction token 分布会变化。
+`caption_1` 写入数据行的 `instruction` 字段，训练时编码为 `instruct_ids`；`text` 只包含需要朗读的 transcript。严禁把两者拼成 `Instruction: ...\nText: ...` 后送入 `input_ids`，否则模型会把 caption 当作朗读内容。student 和 teacher 使用同一 caption，teacher 仍额外使用 `teacher_ref_audio/text` 作为 ICL 特权信息。
 
-## 8. 测试与短程检查
+## 8. EmotionTalk 三模型评测
+
+批量推理脚本统一使用 `sft_test.jsonl` 的 instruction、target text 和独立 enrollment，支持逐条写 manifest 和断点续跑。三个 run 必须使用相同 `SEED` 和 generation 参数：
+
+```bash
+# Base：caption 走独立 instruct 通道，作为未经微调的控制基线
+MODEL_PATH=/opt/data/private/jsj/Qwen3-TTS-12Hz-1.7B-Base \
+MODEL_NAME=base_instruction \
+OUTPUT_DIR=outputs/emotiontalk_eval_caption/base_instruction \
+DEVICE=cuda:0 \
+bash scripts/eval_emotiontalk.sh
+
+# SFT
+MODEL_PATH=checkpoints/emotiontalk_sft_caption/final \
+MODEL_NAME=sft_instruction \
+OUTPUT_DIR=outputs/emotiontalk_eval_caption/sft_instruction \
+DEVICE=cuda:0 \
+bash scripts/eval_emotiontalk.sh
+
+# OPD
+MODEL_PATH=checkpoints/emotiontalk_opd_caption/final \
+MODEL_NAME=opd_instruction \
+OUTPUT_DIR=outputs/emotiontalk_eval_caption/opd_instruction \
+DEVICE=cuda:0 \
+bash scripts/eval_emotiontalk.sh
+```
+
+用 `--limit 3` 做 smoke test；再次执行不带 `--limit` 会跳过已经成功生成的样本并继续完整测试集。错误样本默认不会反复重试，可显式传 `--retry-errors`。
+
+三个 run 有共同完成的样本后，生成盲听页面、盲化映射和 API judge JSONL：
+
+```bash
+python -m qwen3opsd.build_eval_report \
+  --input-jsonl data/processed/emotiontalk/sft_test.jsonl \
+  --run Base=outputs/emotiontalk_eval_caption/base_instruction/manifest.jsonl \
+  --run SFT=outputs/emotiontalk_eval_caption/sft_instruction/manifest.jsonl \
+  --run OPD=outputs/emotiontalk_eval_caption/opd_instruction/manifest.jsonl \
+  --output-dir outputs/emotiontalk_eval_caption/report
+```
+
+打开 `outputs/emotiontalk_eval_caption/report/listen.html` 可以逐条听 enrollment、ground truth 和随机盲化后的三个系统。页面评分保存在浏览器 local storage，并可导出 JSON。`api_judge.jsonl` 保留未盲化的模型名和绝对音频路径，供 Gemini 或其他 Audio-LLM judge 使用。
+
+如果需要原始语音克隆内容基线，再单独运行 Base 并设置 `CONDITIONING=text_only`；不要用它替代同协议的 `base_instruction`。
+
+### InstructTTSEval 人工试听
+
+官方仓库和数据集分别下载到 `/opt/data/private/jsj/InstructTTSEval` 与 `/opt/data/private/jsj/InstructTTSEval-dataset`。以下命令从中文 1000 条中确定性选择互不重叠的 APS/DSD/RP 各 20 条，解出 GT reference audio，并为 voice-clone 模型配置独立的男/女 enrollment：
+
+```bash
+python -m qwen3opsd.prepare_instructttseval \
+  --parquet /opt/data/private/jsj/InstructTTSEval-dataset/zh.parquet \
+  --language zh \
+  --output-dir data/processed/instructttseval_zh_60 \
+  --male-enrollment data/raw/emotiontalk/extracted/Audio/wav/G00003/G00003_11/G00003_11_13/G00003_11_13_001.wav \
+  --female-enrollment data/raw/emotiontalk/extracted/Audio/wav/G00003/G00003_11/G00003_11_02/G00003_11_02_002.wav \
+  --num-per-task 20 \
+  --seed 20260716
+```
+
+输出的 `zh_eval.jsonl` 可直接作为 `scripts/eval_emotiontalk.sh` 的 `INPUT_JSONL`。三模型完成后继续用 `build_eval_report` 生成试听页；页面逐条展示 instruction、文本、独立 enrollment、官方 GT 和随机盲化的模型音频。GT 只用于试听对比，绝不作为模型输入。`--num-per-task 0` 会展开完整的 3000 个中文 task 实例。
+
+## 9. 测试与短程检查
 
 ```bash
 python -m unittest discover -s tests -v
@@ -330,7 +439,7 @@ MAX_STEPS=1 MAX_NEW_TOKENS=32 SAVE_FREQ=0 bash scripts/train_opd.sh --overwrite
 
 确认 loss、grad norm、checkpoint reload 均正常，再移除 `MAX_STEPS`。
 
-## 9. 常见问题
+## 10. 常见问题
 
 **`403 GatedRepo`**
 
