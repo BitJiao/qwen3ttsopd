@@ -20,7 +20,7 @@ case "${TEACHER_MODE}" in
     exit 1
     ;;
 esac
-: "${STUDENT_MODEL:?set STUDENT_MODEL_PATH to a Qwen3-TTS VoiceDesign checkpoint}"
+: "${STUDENT_MODEL:?set STUDENT_MODEL_PATH to a Base or VoiceDesign checkpoint}"
 : "${TEACHER_MODEL:?set TEACHER_MODEL_PATH for the selected TEACHER_MODE}"
 
 "${PYTHON:-${ROOT}/.venv/bin/python}" -m qwen3opsd.train_opd \

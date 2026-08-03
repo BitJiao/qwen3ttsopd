@@ -15,6 +15,7 @@ export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
   --audio-root "${AUDIO_ROOT}" \
   --output-dir "${OUTPUT_DIR}" \
   --caption-key "${CAPTION_KEY:-caption_1}" \
+  --student-mode "${STUDENT_MODE:-base}" \
   --on-invalid-group "${ON_INVALID_GROUP:-skip}" \
   --check-audio \
   "$@"

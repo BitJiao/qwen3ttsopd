@@ -1,0 +1,20 @@
+{
+  "source_rows": 19250,
+  "enrollment_rows": 21,
+  "sft_train": 15400,
+  "opd_train": 15134,
+  "sft_val": 1904,
+  "opd_val": 1904,
+  "sft_test": 1925,
+  "opd_test": 1891,
+  "audit_groups": 1476,
+  "valid_groups": 1452,
+  "skipped_groups": {
+    "same_text_pair": 20,
+    "single_utterance": 4
+  },
+  "opd_reference_cycle_verified": true,
+  "target_teacher_audio_leaks": 0,
+  "target_student_audio_leaks": 0,
+  "license": "CC BY-NC-SA 4.0 (non-commercial)"
+}

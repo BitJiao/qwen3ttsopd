@@ -1,0 +1,51 @@
+{
+  "generated_from": "portable sft/opd manifests",
+  "speaker_split": {
+    "train": ["05", "06", "07", "08", "09", "10", "11", "12", "14", "16", "17", "18", "19"],
+    "val": ["01", "02", "13", "15"],
+    "test": ["02", "13", "20", "21"]
+  },
+  "sft_emotion_counts": {
+    "train": {
+      "angry": 3057,
+      "disgusted": 612,
+      "fearful": 470,
+      "happy": 1713,
+      "neutral": 7563,
+      "sad": 898,
+      "surprised": 1087
+    },
+    "val": {
+      "angry": 417,
+      "disgusted": 69,
+      "fearful": 96,
+      "happy": 208,
+      "neutral": 863,
+      "sad": 118,
+      "surprised": 133
+    },
+    "test": {
+      "angry": 345,
+      "disgusted": 137,
+      "fearful": 89,
+      "happy": 176,
+      "neutral": 942,
+      "sad": 94,
+      "surprised": 142
+    }
+  },
+  "opd_train_reference_emotion_match": {
+    "total": 15134,
+    "matched": 8969,
+    "rate": 0.592639090788951,
+    "by_target_emotion": {
+      "angry": {"total": 3029, "matched": 2232},
+      "disgusted": {"total": 605, "matched": 105},
+      "fearful": {"total": 468, "matched": 163},
+      "happy": {"total": 1695, "matched": 762},
+      "neutral": {"total": 7418, "matched": 4891},
+      "sad": {"total": 866, "matched": 556},
+      "surprised": {"total": 1053, "matched": 260}
+    }
+  }
+}

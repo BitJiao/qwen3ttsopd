@@ -8,25 +8,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from accelerate import Accelerator
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from qwen3opsd.data_contract import validate_sft_row
-from qwen3opsd.sft_dataset import VoiceDesignSFTDataset
-from qwen3tts_opd.core import (
-    conditioned_token_logits,
-    first_codebook_labels_with_eos,
-    first_codebook_logits_with_eos,
-    load_jsonl,
-    resolve_local_model_dir,
-    save_checkpoint,
-    token_ce,
-)
+from qwen3opsd.sft_dataset import InstructionSFTDataset
+from qwen3tts_opd.core import conditioned_token_logits, load_jsonl, resolve_local_model_dir, save_checkpoint
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Instruction SFT for Qwen3-TTS VoiceDesign.")
+    parser = argparse.ArgumentParser(description="Multi-speaker instruction SFT for Qwen3-TTS Base.")
     parser.add_argument("--init-model-path", required=True)
     parser.add_argument("--train-jsonl", required=True)
     parser.add_argument("--output-dir", default="checkpoints/emotiontalk_sft")
@@ -53,11 +45,6 @@ def main() -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    rows = load_jsonl(args.train_jsonl)
-    if not rows:
-        raise ValueError(f"no rows loaded from {args.train_jsonl}")
-    for row_number, row in enumerate(rows, start=1):
-        validate_sft_row(row, row_number=row_number)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -71,16 +58,17 @@ def main() -> None:
         dtype=load_dtype,
         attn_implementation=args.attn_implementation,
     )
-    if tts.model.tts_model_type != "voice_design":
-        raise ValueError(
-            f"instruction SFT requires a Qwen3-TTS VoiceDesign checkpoint, got {tts.model.tts_model_type}"
-        )
+    if tts.model.tts_model_type != "base" or tts.model.speaker_encoder is None:
+        raise ValueError("instruction SFT requires a Qwen3-TTS Base checkpoint")
     for parameter in tts.model.parameters():
         parameter.requires_grad_(False)
     for parameter in tts.model.talker.parameters():
         parameter.requires_grad_(True)
 
-    dataset = VoiceDesignSFTDataset(rows)
+    rows = load_jsonl(args.train_jsonl)
+    if not rows:
+        raise ValueError(f"no rows loaded from {args.train_jsonl}")
+    dataset = InstructionSFTDataset(rows)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
     optimizer = AdamW((parameter for parameter in tts.model.talker.parameters() if parameter.requires_grad), lr=args.lr, weight_decay=args.weight_decay)
     model, optimizer, dataloader = accelerator.prepare(tts.model, optimizer, dataloader)
@@ -92,6 +80,7 @@ def main() -> None:
             raise FileExistsError(f"output directory is not empty: {output_dir}; pass --overwrite")
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    prompt_cache: dict[tuple[str, str | None, bool], object] = {}
     global_step = 0
 
     def save(name: str) -> None:
@@ -104,28 +93,25 @@ def main() -> None:
 
     model.train()
     for epoch in range(args.num_epochs):
-        for batch_rows in dataloader:
+        for batch in dataloader:
             with accelerator.accumulate(model):
                 first_losses = []
                 sub_losses = []
-                for row in batch_rows:
-                    target_codes = row["audio_codes"]
+                for sample, target_codes in zip(batch["samples"], batch["audio_codes"]):
+                    target_codes = target_codes.to(accelerator.device)
                     logits = conditioned_token_logits(
                         tts,
-                        row,
+                        sample,
                         target_codes,
-                        conditioning="voice_design",
+                        x_vector_only_mode=True,
                         non_streaming_mode=True,
+                        prompt_cache=prompt_cache,
                     )
-                    first_logits = first_codebook_logits_with_eos(logits)
-                    first_labels = first_codebook_labels_with_eos(tts.model, target_codes, first_logits.device)
-                    first_losses.append(token_ce(first_logits, first_labels))
-                    sub_losses.append(
-                        token_ce(
-                            logits.sub_codebooks,
-                            target_codes[:, 1:].to(logits.sub_codebooks.device),
-                        )
-                    )
+                    first_losses.append(F.cross_entropy(logits.first_codebook, target_codes[:, 0]))
+                    sub_losses.append(F.cross_entropy(
+                        logits.sub_codebooks.reshape(-1, logits.sub_codebooks.shape[-1]),
+                        target_codes[:, 1:].reshape(-1),
+                    ))
                 first_loss = torch.stack(first_losses).mean()
                 sub_loss = torch.stack(sub_losses).mean()
                 loss = first_loss + args.sub_loss_weight * sub_loss

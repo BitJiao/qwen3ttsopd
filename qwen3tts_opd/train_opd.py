@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import random
+import re
 import shutil
 import time
 from pathlib import Path
@@ -28,13 +29,14 @@ from qwen3tts_opd.core import (
     token_kl,
     torch_dtype,
 )
+from qwen3tts_opd.instruction_utils import get_instruction, get_target_text
 from qwen3tts_opd.teacher_modes import TEACHER_MODES, get_teacher_mode, validate_opd_row
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="On-policy distillation trainer for Qwen3-TTS.")
     parser.add_argument("--student_model_path", "--model_path", dest="student_model_path", required=True)
-    parser.add_argument("--teacher_model_path", required=True)
+    parser.add_argument("--teacher_model_path", default=None)
     parser.add_argument("--teacher_mode", choices=sorted(TEACHER_MODES), default="base_icl")
     parser.add_argument("--input_jsonl", required=True)
     parser.add_argument("--output_dir", default="checkpoints/qwen3_tts_opd")
@@ -63,6 +65,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subtalker_top_p", type=float, default=1.0)
     parser.add_argument("--non_streaming_mode", action="store_true", default=True)
     parser.add_argument("--streaming_mode", dest="non_streaming_mode", action="store_false")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        "--resume-from-checkpoint",
+        default=None,
+        help="Resume student weights from a step_N checkpoint and skip the completed rows.",
+    )
+    parser.add_argument(
+        "--resume_step",
+        "--resume-step",
+        type=int,
+        default=None,
+        help="Completed global step. Normally inferred from the step_N checkpoint name.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -73,6 +88,41 @@ def _device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
+def _resolve_resume_step(checkpoint: str | None, explicit_step: int | None) -> int:
+    if checkpoint is None:
+        if explicit_step is not None:
+            raise ValueError("--resume-step requires --resume-from-checkpoint")
+        return 0
+    if explicit_step is not None and explicit_step < 0:
+        raise ValueError("--resume-step must be non-negative")
+
+    match = re.fullmatch(r"step_(\d+)", Path(checkpoint).name)
+    inferred_step = int(match.group(1)) if match else None
+    if explicit_step is None:
+        if inferred_step is None:
+            raise ValueError("cannot infer resume step; pass --resume-step")
+        return inferred_step
+    if inferred_step is not None and explicit_step != inferred_step:
+        raise ValueError(
+            f"--resume-step {explicit_step} does not match checkpoint name {Path(checkpoint).name}"
+        )
+    return explicit_step
+
+
+def _validate_student_row(row: dict, *, student_model_type: str) -> None:
+    if not get_instruction(row):
+        raise ValueError("each OPD row must contain a non-empty caption/instruction")
+    get_target_text(row)
+    if student_model_type == "voice_design":
+        return
+    student_audio = row.get("student_spk_audio", row.get("ref_audio"))
+    if not student_audio:
+        raise KeyError("each row must contain student_spk_audio (or legacy ref_audio)")
+    target_audio = row.get("target_audio", row.get("audio"))
+    if target_audio and os.path.realpath(target_audio) == os.path.realpath(student_audio):
+        raise ValueError("target_audio and student_spk_audio must be different")
+
+
 def main() -> None:
     ensure_qwen3_tts_repo_on_path()
     args = parse_args()
@@ -81,15 +131,16 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    resume_step = _resolve_resume_step(args.resume_from_checkpoint, args.resume_step)
+    initial_student_dir = resolve_local_model_dir(args.student_model_path)
+    student_dir = resolve_local_model_dir(args.resume_from_checkpoint or args.student_model_path)
+    teacher_dir = resolve_local_model_dir(args.teacher_model_path or args.student_model_path)
     data = load_jsonl(args.input_jsonl)
     if not data:
         raise ValueError(f"no rows loaded from {args.input_jsonl}")
     for row_number, row in enumerate(data, start=1):
         validate_opd_row(row, args.teacher_mode, row_number=row_number)
     teacher_mode = get_teacher_mode(args.teacher_mode)
-
-    student_dir = resolve_local_model_dir(args.student_model_path)
-    teacher_dir = resolve_local_model_dir(args.teacher_model_path)
     student_device = _device(args.device)
     teacher_device = _device(args.teacher_device or args.device)
     student_dtype = torch_dtype(args.dtype if student_device.type != "cpu" else "fp32")
@@ -97,8 +148,10 @@ def main() -> None:
 
     student = load_tts(student_dir, student_dtype, args.attn_implementation, student_device)
     teacher = load_tts(teacher_dir, teacher_dtype, args.attn_implementation, teacher_device)
-    if student.model.tts_model_type != "voice_design":
-        raise ValueError(f"OPD student must be VoiceDesign, got {student.model.tts_model_type}")
+    if student.model.tts_model_type not in {"base", "voice_design"}:
+        raise ValueError(f"unsupported OPD student type: {student.model.tts_model_type}")
+    if student.model.tts_model_type == "base" and getattr(student.model, "speaker_encoder", None) is None:
+        raise ValueError("Base OPD student checkpoint has no speaker_encoder")
     if teacher.model.tts_model_type != teacher_mode.model_type:
         raise ValueError(
             f"teacher_mode={teacher_mode.name} requires {teacher_mode.model_type}, "
@@ -121,6 +174,9 @@ def main() -> None:
             f"{student.model.tokenizer_type} vs {teacher.model.tokenizer_type}"
         )
 
+    for row in data:
+        _validate_student_row(row, student_model_type=student.model.tts_model_type)
+
     for param in student.model.parameters():
         param.requires_grad_(False)
     for param in student.model.talker.parameters():
@@ -130,22 +186,49 @@ def main() -> None:
         param.requires_grad_(False)
 
     output_root = Path(args.output_dir)
+    if args.resume_from_checkpoint and args.overwrite:
+        raise ValueError("--resume-from-checkpoint cannot be combined with --overwrite")
     if output_root.exists() and args.overwrite:
         shutil.rmtree(output_root)
+    elif output_root.exists() and any(output_root.iterdir()) and not args.resume_from_checkpoint:
+        raise FileExistsError(
+            f"output directory is not empty: {output_root}; pass --overwrite or resume explicitly"
+        )
     output_root.mkdir(parents=True, exist_ok=True)
 
     optimizer = AdamW(student.model.talker.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     planned_steps = len(data) * args.num_epochs
     if args.max_steps > 0:
         planned_steps = min(planned_steps, args.max_steps)
+    if resume_step >= planned_steps:
+        raise ValueError(f"resume step {resume_step} must be smaller than planned steps {planned_steps}")
 
-    global_step = 0
+    global_step = resume_step
+    skipped_rows = 0
     begin = time.perf_counter()
+    if resume_step:
+        print(
+            json.dumps(
+                {
+                    "event": "resume",
+                    "checkpoint": student_dir,
+                    "initial_student": initial_student_dir,
+                    "step": resume_step,
+                    "optimizer_state": "reset",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
     for epoch in range(args.num_epochs):
         if args.shuffle:
             random.shuffle(data)
 
         for row in data:
+            if skipped_rows < resume_step:
+                skipped_rows += 1
+                continue
+
             student_codes = generate_student_codes(student, row, args)
             if student_codes.numel() == 0:
                 continue
@@ -164,7 +247,11 @@ def main() -> None:
                 student,
                 row,
                 student_codes.to(student_device),
-                conditioning="voice_design",
+                conditioning=(
+                    "voice_design"
+                    if student.model.tts_model_type == "voice_design"
+                    else "student_xvector"
+                ),
                 non_streaming_mode=args.non_streaming_mode,
             )
 
@@ -191,7 +278,8 @@ def main() -> None:
 
             global_step += 1
             elapsed = time.perf_counter() - begin
-            avg = elapsed / max(global_step, 1)
+            completed_this_run = global_step - resume_step
+            avg = elapsed / max(completed_this_run, 1)
             remaining = max(planned_steps - global_step, 0)
             print(
                 json.dumps(
