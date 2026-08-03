@@ -4,7 +4,15 @@ from typing import Any
 
 
 def get_instruction(item: dict[str, Any]) -> str:
-    for key in ("instruction", "final_audio_caption", "emotion_instruction", "style_instruction", "instruct"):
+    for key in (
+        "instruction",
+        "caption",
+        "caption_simplify_v1",
+        "final_audio_caption",
+        "emotion_instruction",
+        "style_instruction",
+        "instruct",
+    ):
         value = item.get(key)
         if value is not None and str(value).strip():
             return str(value).strip()

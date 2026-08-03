@@ -5,8 +5,10 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 export PYTHONPATH="${ROOT}:${QWEN3_TTS_REPO:-${ROOT}/../Qwen3-TTS-main}:${PYTHONPATH:-}"
 
+: "${MODEL_PATH:?set MODEL_PATH to a Qwen3-TTS Base checkpoint}"
+
 "${PYTHON:-${ROOT}/.venv/bin/python}" -m qwen3opsd.train_sft \
-  --init-model-path "${MODEL_PATH:?set MODEL_PATH}" \
+  --init-model-path "${MODEL_PATH}" \
   --train-jsonl "${TRAIN_JSONL:-data/processed/emotiontalk/sft_train_with_codes.jsonl}" \
   --output-dir "${OUTPUT_DIR:-checkpoints/emotiontalk_sft}" \
   --batch-size "${BATCH_SIZE:-1}" \

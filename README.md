@@ -1,15 +1,17 @@
-# Qwen3-TTS Instruction SFT + ICL Teacher OPD
+# Qwen3-TTS Emotion SFT + Multi-Mode OPD
 
-本仓库实现面向 Qwen3-TTS Base 的两阶段训练：
+本仓库实现两条可对照的情感可控训练路径：严格多说话人 Base/x-vector student 主线，以及 VoiceDesign student 实验线。两者都可使用冻结 Base ICL teacher；VoiceDesign 还可使用无 ICL 的冻结 VoiceDesign teacher。
 
-1. **Instruction SFT**：student 输入自然语言语音风格 instruction、目标文本和独立的说话人 enrollment 音频。
+1. **Instruction SFT**：caption 通过官方独立 `instruct_ids` 输入；Base student 额外读取独立同 speaker enrollment，VoiceDesign student 不读取 enrollment。
 2. **On-Policy Distillation (OPD)**：student 用自己的条件采样 codec trajectory；冻结 teacher 在相同 trajectory 上额外读取同场景参考音频和转写（ICL），逐 token 蒸馏给 student。
 
 ```text
-student: instruction + target text + student_spk_audio (x-vector only)
-teacher: instruction + target text + teacher_ref_audio/text (ICL)
+student A: Base(instruction + target text + enrollment x-vector)
+student B: VoiceDesign(instruction + target text)
+teacher A: Base(target text + teacher_ref_audio/text ICL)
+teacher B: frozen VoiceDesign(instruction + target text, no ICL)
 action:  student 自己采样的 16-codebook codec trajectory
-loss:    first-codebook KL + sub-codebook KL + small student CE
+loss:    first-codebook/EOS KL + sub-codebook KL + small student CE
 ```
 
 这里没有 ASR reward、chosen/rejected 数据、DPO loss 或基于 caption 相似度的配对筛选。
@@ -22,7 +24,7 @@ loss:    first-codebook KL + sub-codebook KL + small student CE
 |---|---|
 | EmotionTalk 数据 | gated 音频已下载，19,250 条 metadata 已全量转换 |
 | 全量转换审计 | 1,452 个有效循环组 |
-| 单元测试 | 22/22 通过 |
+| 单元测试 | 43/43 通过 |
 | Qwen3-TTS Base 加载 | 1.7B Base、16 codebooks，GPU 加载成功 |
 | Caption SFT | 3 epochs、5,775 optimizer steps 已完成 |
 | Caption OPD | 3,222 / 15,134 samples；最近 checkpoint 为 `step_3000`，需在新服务器续跑 |
@@ -36,12 +38,19 @@ loss:    first-codebook KL + sub-codebook KL + small student CE
 qwen3opsd/
   emotiontalk.py       EmotionTalk 转换、循环配对和审计
   portable_manifest.py 跨服务器导出/物化相对音频路径
+  prepare_cached_opd.py 缓存 codes/spk embedding 数据的 OPD 配对
   prepare_codes.py     提取 Qwen3-TTS 12 Hz target codec
-  sft_dataset.py       多说话人 instruction SFT dataset/collator
-  train_sft.py         Base-compatible SFT trainer
+  data_contract.py     VoiceDesign SFT JSONL 结构校验
+  sft_dataset.py       Base / VoiceDesign instruction SFT datasets
+  train_sft.py         Base 多说话人 SFT trainer
+  train_vd_sft.py      VoiceDesign SFT trainer
+  qualify_teachers.py  student/Base-ICL/VD 三方 target-NLL 比较
+  compare_inference.py student/Base-ICL/VD 三方生成推理对比
   train_opd.py         OPD 入口
   infer.py             SFT/OPD checkpoint 推理
 qwen3tts_opd/
+  conditioning.py      VoiceDesign student / Base teacher 条件输入契约
+  teacher_modes.py     Base-ICL / VoiceDesign teacher 模式定义
   core.py              token replay、teacher/student logits、KL、保存
   train_opd.py         OPD 训练实现（保留旧包兼容）
 scripts/
@@ -49,7 +58,10 @@ scripts/
   download_emotiontalk.sh
   convert_emotiontalk.sh
   prepare_sft.sh
+  prepare_cached_opd.sh
   train_sft.sh
+  qualify_teachers.sh
+  compare_inference.sh
   train_opd.sh
 tests/
 ```
@@ -63,7 +75,9 @@ tests/
 - Linux、Python 3.10+
 - NVIDIA GPU；完整训练建议 40 GB 以上显存
 - Qwen3-TTS 官方源码 checkout
-- Qwen3-TTS-12Hz-1.7B-Base 或 0.6B-Base 权重
+- Qwen3-TTS-12Hz-1.7B-Base 权重（Base student/ICL teacher）
+- 可选：Qwen3-TTS-12Hz-1.7B-VoiceDesign student 权重
+- 可选：独立冻结 VoiceDesign teacher checkpoint（无 ICL 候选）
 - `ffmpeg`、SoX
 
 ```bash
@@ -149,7 +163,7 @@ G00009/G00009_42/G00009_42_14/G00009_42_14_024
 - test：`G00003`、`G00015`
 - 其余为 train
 
-每个 split 内为每位 speaker 单独保留一条 enrollment，且该音频不再作为 target 或 teacher reference。这样 train 不会读取 validation/test enrollment。
+portable manifests 按 split 和 speaker 预留独立 enrollment，供 Base student 使用；VoiceDesign student 会忽略这些 enrollment。OPD teacher reference 始终严格限制在同 speaker、同 scene 内。
 
 OPD 严格按 `(speaker_id, scene_id)` 分组：
 
@@ -183,6 +197,7 @@ python -m qwen3opsd.emotiontalk \
   --audio-root data/raw/emotiontalk/extracted \
   --output-dir data/processed/emotiontalk \
   --caption-key caption_1 \
+  --student-mode base \
   --on-invalid-group skip \
   --check-audio \
   --check-audio-hash
@@ -190,22 +205,7 @@ python -m qwen3opsd.emotiontalk \
 
 `--check-audio-hash` 最严格但会读取全部音频；大规模转换可先只用 `--check-audio`，正式训练前再跑一次 hash 审计。
 
-仅 metadata 的全量审计结果（保留 enrollment 后）：
-
-```json
-{
-  "source_rows": 19250,
-  "enrollment_rows": 21,
-  "sft_train": 15400,
-  "sft_val": 1904,
-  "sft_test": 1925,
-  "opd_train": 15134,
-  "opd_val": 1904,
-  "opd_test": 1891,
-  "valid_groups": 1452,
-  "skipped_groups": {"same_text_pair": 20, "single_utterance": 4}
-}
-```
+当前 portable manifests 的确切计数见 `dataset_manifests/emotiontalk/summary.json`；重新运行转换后应以新生成的 `summary.json` 和 `group_audit.jsonl` 为准。
 
 输出包括：
 
@@ -223,8 +223,10 @@ summary.json
 | `text` | student + teacher | 当前 target 转写 |
 | `instruction` | student + teacher | 当前 target 的综合语音 caption |
 | `target_audio` / `audio` | SFT | 当前要学习的音频 |
-| `student_spk_audio` | SFT + OPD student | 独立 enrollment，仅提取 x-vector |
+| `student_spk_audio` | Base SFT/OPD student | 与 target 分离的同 speaker enrollment；VoiceDesign 忽略 |
 | `teacher_ref_audio` | OPD teacher | 同 speaker、同 scene 的下一条音频 |
+| `teacher_ref_codes_path` | OPD teacher | 缓存 ICL reference 的 `[T,16]` codec `.npy` |
+| `teacher_ref_spk_emb_path` | OPD teacher | 缓存 ICL reference 的 speaker embedding `.npy` |
 | `teacher_ref_text` | OPD teacher | teacher reference 的准确转写 |
 
 `ref_audio/ref_text` 仅为兼容旧入口；新代码优先读取语义明确的字段。
@@ -262,6 +264,62 @@ checkpoints/emotiontalk_opd_caption/step_3000/
 
 只传 GitHub 仓库时，可以在新服务器重新完成 SFT，再从头运行 OPD。
 
+### 4.1 训练 JSONL 的准确结构
+
+训练文件是 **JSONL**，不是一个 JSON 数组：每一行必须是一个完整 JSON object，行尾不加逗号，文件外层也不加 `[` / `]`。仓库脚本先 `cd` 到仓库根目录，因此相对音频路径默认相对于仓库根目录；在其他目录直接运行 Python 时建议使用绝对路径。
+
+SFT 提取 codec 前的输入，例如 `sft_train.jsonl`：
+
+```jsonl
+{"text":"今天很高兴见到你。","instruction":"女性声音清亮自然，语速稍快。","target_audio":"data/audio/target_001.wav","language":"Chinese"}
+{"text":"我们明天再讨论这个问题。","instruction":"语气平静、自然。","target_audio":"data/audio/target_002.wav","language":"Chinese"}
+```
+
+`target_audio` 是推荐字段；旧数据可以用 `audio` 代替。VoiceDesign SFT 不需要 `student_spk_audio/ref_audio`。运行 `scripts/prepare_sft.sh` 后，每行会保留原字段并增加 `audio_codes`：
+
+```jsonl
+{"text":"今天很高兴见到你。","instruction":"女性声音清亮自然，语速稍快。","target_audio":"data/audio/target_001.wav","language":"Chinese","audio_codes":[[101,202,303,404,505,606,707,808,909,1001,1102,1203,1304,1405,1506,1607],[102,203,304,405,506,607,708,809,910,1002,1103,1204,1305,1406,1507,1608]]}
+```
+
+这里 `audio_codes` 的形状必须是 `[T, 16]`：外层长度 `T` 是 12 Hz codec 帧数，每一帧恰好包含 16 个 codebook token。示例只写了两帧用于展示结构，真实音频会有更多帧。`TRAIN_JSONL` 可以指向这个带 `audio_codes` 的文件，也可以使用下文带 `codes_path` 的缓存格式。
+
+OPD 的 `INPUT_JSONL` 不需要预先生成 `audio_codes`，因为 trajectory 由 student 在线采样。每行推荐结构如下：
+
+```jsonl
+{"text":"今天很高兴见到你。","instruction":"女性声音清亮自然，语速稍快。","target_audio":"data/audio/target_001.wav","teacher_ref_audio":"data/audio/same_scene_002.wav","teacher_ref_text":"这是一条同场景参考语音的准确转写。","language":"Chinese"}
+```
+
+OPD 始终需要 `text`（或 `target_text`）。`base_icl` 模式需要 `teacher_ref_text`，并在 `teacher_ref_audio` 与缓存字段 `teacher_ref_codes_path + teacher_ref_spk_emb_path` 之间二选一；单独运行 `voice_design` teacher 模式不要求这些 ICL 字段。`instruction` 允许为空但 VoiceDesign 训练通常应提供，`language` 和仅用于泄漏检查/审计的 `target_audio` 可以省略。
+
+### 4.2 已缓存 codes/spk embedding 的 JSONL
+
+也支持如下已有数据，不需要把 `.npy` 展开写进 JSONL：
+
+```jsonl
+{"key":"小艺/sample_000001","text":"可以呀，你是发生什么事儿了？","codes_path":"/data/qwen3tts_codes/小艺/sample_000001.npy","spk_emb_path":"/data/qwen3tts_spk_emb/小艺/sample_000001.npy","language":"Auto","caption":"一位青年女性用清澈甜美的嗓音温柔地给予安慰。","caption_simplify_v1":"青年女性以温柔关怀的语气说话。"}
+```
+
+- `caption` 自动作为 VoiceDesign instruction；仅当它为空时才回退到 `caption_simplify_v1`。
+- `codes_path` 可直接供 SFT 和 NLL qualification 读取，支持 `[T,16]`、`[16,T]` 或带单个 batch 维的形式；必须由与 student/Base 相同的 Qwen3-TTS 12 Hz tokenizer 生成。
+- `spk_emb_path` 不会输入 VoiceDesign student。它只在作为另一条样本的 Base teacher ICL reference 时使用。
+- OPD trajectory 仍由 student 在线生成，因此 target 自己的 `codes_path` 不参与 OPD loss。
+
+Base ICL 不允许拿 target 自己当 reference。先按 speaker 配对；默认依次读取 `speaker_id`、`speaker`、`spk`，若都没有则使用 `key` 的第一段（上例为 `小艺`）：
+
+```bash
+INPUT_JSONL=/data/train_cached.jsonl \
+OUTPUT_JSONL=/data/train_cached_opd.jsonl \
+bash scripts/prepare_cached_opd.sh
+```
+
+转换器会保留原字段，并从同 speaker 的另一条不同文本样本增加：
+
+```jsonl
+{"key":"小艺/sample_000001","text":"可以呀，你是发生什么事儿了？","codes_path":"/data/qwen3tts_codes/小艺/sample_000001.npy","spk_emb_path":"/data/qwen3tts_spk_emb/小艺/sample_000001.npy","language":"Auto","caption":"一位青年女性用清澈甜美的嗓音温柔地给予安慰。","teacher_ref_key":"小艺/sample_000002","teacher_ref_codes_path":"/data/qwen3tts_codes/小艺/sample_000002.npy","teacher_ref_spk_emb_path":"/data/qwen3tts_spk_emb/小艺/sample_000002.npy","teacher_ref_text":"这是 reference 音频对应的准确文本。"}
+```
+
+这三个 `teacher_ref_*` 字段共同构造完整 Base ICL：`ref_code + ref_spk_embedding + ref_text`，内部固定为 `x_vector_only_mode=False`、`icl_mode=True`。若你的 speaker 字段另有名称，例如 `speaker_name`，设置 `SPEAKER_FIELD=speaker_name`。
+
 ## 5. Instruction SFT
 
 先提取 target audio codes：
@@ -286,20 +344,91 @@ LR=2e-6 \
 bash scripts/train_sft.sh --overwrite
 ```
 
-与官方单说话人 SFT 的关键差别：
+训练约束：
 
-- 每条样本读取自己的 `student_spk_audio`，支持 EmotionTalk 多说话人。
-- enrollment 自动重采样到 speaker encoder 需要的 24 kHz。
+- `scripts/train_sft.sh` 要求 `tts_model_type=base`，每条样本读取自己的 `student_spk_audio`。
+- instruction 使用官方独立 user prompt，不会拼进 assistant target text。
 - speaker encoder 和 speech tokenizer 冻结，只训练 talker。
-- checkpoint 保持 `tts_model_type=base`，仍支持 voice-clone/ICL；不会改成单一 `custom_voice` speaker。
+- VoiceDesign 对照实验使用 `MODEL_PATH=... bash scripts/train_vd_sft.sh`，不读取 enrollment。
 
-## 6. ICL Teacher OPD
+## 6. Teacher Qualification 与 OPD
 
-推荐 student 从 SFT checkpoint 开始。teacher 可以使用同一 SFT checkpoint 的冻结副本，使两边权重相同、只有 privileged conditioning 不同；也可以指定原始或更强的兼容 Base checkpoint。
+OPD 支持两个冻结 teacher 候选：
+
+- `base_icl`：Base teacher 读取 target text 和音频或缓存形式的 teacher ICL reference。
+- `voice_design`：VD teacher 只读取与 student 相同的 instruction/target text，不使用 ICL。
+
+先给 OPD validation 子集补 target `audio_codes`：
 
 ```bash
-STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft_caption/final \
-TEACHER_MODEL_PATH=checkpoints/emotiontalk_sft_caption/final \
+MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
+INPUT_JSONL=data/processed/emotiontalk/opd_val.jsonl \
+OUTPUT_JSONL=data/processed/emotiontalk/opd_val_with_codes.jsonl \
+bash scripts/prepare_sft.sh
+```
+
+然后顺序加载 student 和 Base-ICL teacher，在相同真实 target codes 上比较 codec-0、EOS、sub-codebook 和总 NLL：
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_vd_sft/final \
+BASE_TEACHER_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
+INPUT_JSONL=data/processed/emotiontalk/opd_val_with_codes.jsonl \
+DEVICE=cuda:0 \
+MAX_SAMPLES=500 \
+bash scripts/qualify_teachers.sh
+```
+
+缓存格式可直接把 `INPUT_JSONL` 设为 `train_cached_opd.jsonl`，脚本会读取其中的 `codes_path`。默认只比较 student 与 Base；设置 `VD_TEACHER_MODEL_PATH` 才会加入第三个 VD teacher。
+
+该工具一次只在设备上保留一个模型，输出：
+
+```text
+results/teacher_qualification/scores.jsonl
+results/teacher_qualification/summary.json
+```
+
+定义 `margin = student_total_nll - teacher_total_nll`。`positive_rate` 越高，teacher 在真实 target 上胜过 student 的样本比例越高。若 `same_student_and_vd_teacher_path=true`，VD teacher 与 student 是同一路径，这个比较通常没有蒸馏价值。NLL qualification 只验证 token 建模能力，正式长跑前仍应补充 WER、风格/情绪匹配和音质生成评测。
+
+再运行三方生成推理，实际比较可懂度、音质和 instruction/情绪匹配。输入使用原始 `opd_val.jsonl` 即可，不要求 `audio_codes`：
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_vd_sft/final \
+BASE_TEACHER_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
+INPUT_JSONL=data/processed/emotiontalk/opd_val.jsonl \
+OUTPUT_DIR=results/inference_comparison \
+DEVICE=cuda:0 \
+MAX_SAMPLES=100 \
+bash scripts/compare_inference.sh
+```
+
+默认只对比 VoiceDesign student 和 Base-ICL teacher。若还要加入第三个无 ICL 的 VD teacher，再设置 `VD_TEACHER_MODEL_PATH=/absolute/path/stronger-VoiceDesign-checkpoint`。脚本按顺序加载模型，单卡同一时刻只保留一个模型；每条样本的各方推理使用相同 seed 和相同采样参数：
+
+```text
+student:    VoiceDesign student + instruction/text
+base_icl:   Base teacher + teacher reference ICL + target text
+vd_teacher: frozen VoiceDesign teacher + instruction/text（无 ICL）
+```
+
+输出结构：
+
+```text
+results/inference_comparison/
+  audio/student/*.wav
+  audio/base_icl/*.wav
+  audio/vd_teacher/*.wav  # 仅设置 VD_TEACHER_MODEL_PATH 时生成
+  manifest.jsonl
+  run_config.json
+  summary.json
+```
+
+`manifest.jsonl` 将同一条样本的 target、instruction、ICL reference 和三份生成音频对应起来，可直接交给 ASR/WER、情绪分类器或人工盲听。中断后用完全相同的参数重跑会跳过已有 wav；参数发生变化时必须改 `OUTPUT_DIR` 或显式传 `--overwrite`，避免混合两次实验。
+
+使用 Base-ICL teacher 训练：
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
+TEACHER_MODEL_PATH=/absolute/path/Qwen3-TTS-12Hz-1.7B-Base \
+TEACHER_MODE=base_icl \
 INPUT_JSONL=data/processed/emotiontalk/opd_train.jsonl \
 OUTPUT_DIR=checkpoints/emotiontalk_opd_caption \
 DEVICE=cuda:0 \
@@ -329,16 +458,31 @@ bash scripts/train_opd.sh --shuffle \
 
 单张 80 GB GPU 也可以把 `DEVICE` 和 `TEACHER_DEVICE` 都设为 `cuda:0`；两张 GPU 会降低单卡显存压力。
 
+使用无 ICL 的 VD teacher 时，只替换 teacher checkpoint 和模式：
+
+```bash
+STUDENT_MODEL_PATH=checkpoints/emotiontalk_sft/final \
+TEACHER_MODEL_PATH=/absolute/path/stronger-VoiceDesign-checkpoint \
+TEACHER_MODE=voice_design \
+INPUT_JSONL=data/processed/emotiontalk/opd_train.jsonl \
+OUTPUT_DIR=checkpoints/emotiontalk_opd_vd_teacher \
+DEVICE=cuda:0 \
+TEACHER_DEVICE=cuda:1 \
+bash scripts/train_opd.sh --shuffle --overwrite
+```
+
+单张 80 GB GPU 也可以把 `DEVICE` 和 `TEACHER_DEVICE` 都设为 `cuda:0`；两张 GPU 会降低训练时的单卡显存压力。
+
 每一步严格执行：
 
-1. student 读取 instruction、target text、`student_spk_audio` 的 x-vector，采样 codec codes。
-2. teacher 读取同样的 instruction/target text，加上 `teacher_ref_audio/text` ICL。
+1. student 按模型类型读取 Base x-vector enrollment 或 VoiceDesign instruction，采样 codec codes。
+2. 所选 teacher 按模式读取 Base ICL 条件或 VD instruction/text 条件。
 3. teacher 和 student 都 replay **同一条 student codes**。
 4. 优化首 codebook KL、子 codebook KL 和小权重 student token CE。
 
 ## 7. 推理
 
-SFT 和 OPD 输出仍是 Base checkpoint，推理时继续提供 enrollment：
+推理入口自动识别 Base 或 VoiceDesign checkpoint；Base 需要 enrollment，VoiceDesign 可省略：
 
 ```bash
 python -m qwen3opsd.infer \
@@ -449,13 +593,13 @@ MAX_STEPS=1 MAX_NEW_TOKENS=32 SAVE_FREQ=0 bash scripts/train_opd.sh --overwrite
 
 Transformers 版本不匹配。使用 `transformers==4.57.3`。
 
-**`Only support 24kHz audio`**
+**模型类型报错**
 
-旧版官方 SFT dataset 直接 assert 24 kHz。本仓库的 enrollment loader 会自动重采样；target audio 由 Qwen tokenizer 正常化。
+SFT/student 必须使用 `Qwen3-TTS-12Hz-1.7B-VoiceDesign`。`TEACHER_MODE=base_icl` 要求 Base checkpoint；`TEACHER_MODE=voice_design` 要求 VoiceDesign checkpoint。VoiceDesign 没有 speaker encoder，因此只能作为无 ICL teacher。
 
 **OPD 显存不足**
 
-把 teacher 放到另一张 GPU；减小 `MAX_NEW_TOKENS`；先使用 0.6B Base 做流程验证。当前实现是一条样本一次 on-policy rollout，不使用数据 batch。
+把所选 teacher 放到另一张 GPU；减小 `MAX_NEW_TOKENS`。当前实现是一条样本一次 on-policy rollout，不使用数据 batch。
 
 **某些组被跳过**
 

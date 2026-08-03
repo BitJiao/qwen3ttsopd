@@ -5,6 +5,7 @@ import unittest
 
 import torch
 
+from qwen3tts_opd.alignment import frame_prediction_slice
 from qwen3tts_opd.core import _replay_token_logits
 
 
@@ -39,9 +40,7 @@ class ReplayAlignmentTest(unittest.TestCase):
         talker = FakeTalker()
         model = SimpleNamespace(
             talker=talker,
-            config=SimpleNamespace(
-                talker_config=SimpleNamespace(codec_eos_token_id=9)
-            ),
+            config=SimpleNamespace(talker_config=SimpleNamespace(codec_eos_token_id=9)),
         )
         codes = torch.tensor([[4], [5]], dtype=torch.long)
         prefill = torch.zeros((1, 3, 4), dtype=torch.float32)
@@ -54,6 +53,15 @@ class ReplayAlignmentTest(unittest.TestCase):
         self.assertEqual(replay.first_codebook[:, 0].tolist(), [2.0, 3.0])
         self.assertEqual(replay.eos_first_codebook[:, 0].tolist(), [4.0])
         self.assertEqual(talker.selected_hidden[:, 0].tolist(), [2.0, 3.0])
+
+    def test_frame_prediction_slice(self) -> None:
+        self.assertEqual(frame_prediction_slice(prefill_length=8, num_frames=3), slice(7, 10))
+
+    def test_invalid_frame_lengths_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            frame_prediction_slice(prefill_length=0, num_frames=1)
+        with self.assertRaises(ValueError):
+            frame_prediction_slice(prefill_length=8, num_frames=-1)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import save_file
 
 from qwen3opsd.instruction_utils import get_instruction, get_target_text
+from qwen3tts_opd.conditioning import teacher_prompt_items, voice_design_inputs
 
 
 def ensure_qwen3_tts_repo_on_path() -> None:
@@ -34,10 +35,29 @@ class TokenLogits:
     codec_0_logits: torch.Tensor | None = None
     codec_0_labels: torch.Tensor | None = None
 
+    @property
+    def eos(self) -> torch.Tensor:
+        if self.eos_first_codebook is None:
+            raise ValueError("replay logits do not contain an EOS step")
+        return self.eos_first_codebook
+
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line_number, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL at {path}:{line_number}: {exc.msg}") from exc
+            if not isinstance(row, dict):
+                raise TypeError(
+                    f"each JSONL line must be an object, got {type(row).__name__} at {path}:{line_number}"
+                )
+            rows.append(row)
+    return rows
 
 
 def torch_dtype(name: str) -> torch.dtype:
@@ -88,20 +108,35 @@ def _prompt_for_sample(
     if x_vector_only_mode:
         ref_audio = sample.get("student_spk_audio", sample.get("ref_audio"))
         ref_text = None
+        if not ref_audio:
+            raise KeyError("sample requires student_spk_audio (or legacy ref_audio)")
+        cache_reference = str(ref_audio)
     else:
         ref_audio = sample.get("teacher_ref_audio", sample.get("ref_audio"))
         ref_text = sample.get("teacher_ref_text", sample.get("ref_text"))
-    if not ref_audio:
-        field = "student_spk_audio" if x_vector_only_mode else "teacher_ref_audio"
-        raise KeyError(f"sample requires {field} (or legacy ref_audio)")
-    cache_key = (str(ref_audio), str(ref_text) if ref_text is not None else None, x_vector_only_mode)
+        cache_reference = str(
+            ref_audio
+            or sample.get("teacher_ref_codes_path", sample.get("ref_codes_path", ""))
+        )
+        if not cache_reference:
+            raise KeyError(
+                "sample requires teacher_ref_audio or cached teacher reference codes"
+            )
+    cache_key = (
+        cache_reference,
+        str(ref_text) if ref_text is not None else None,
+        x_vector_only_mode,
+    )
     prompt_items = prompt_cache.get(cache_key) if prompt_cache is not None else None
     if prompt_items is None:
-        prompt_items = tts.create_voice_clone_prompt(
-            ref_audio=[ref_audio],
-            ref_text=[ref_text],
-            x_vector_only_mode=[x_vector_only_mode],
-        )
+        if x_vector_only_mode:
+            prompt_items = tts.create_voice_clone_prompt(
+                ref_audio=[ref_audio],
+                ref_text=[None],
+                x_vector_only_mode=[True],
+            )
+        else:
+            prompt_items = teacher_prompt_items(tts, sample)
         if prompt_cache is not None:
             prompt_cache[cache_key] = prompt_items
     prompt = tts._prompt_items_to_voice_clone_prompt(prompt_items)
@@ -303,7 +338,6 @@ def build_voice_clone_prefill(
             ),
             dim=1,
         )
-
     if instruct_prefix is not None:
         prefill = torch.cat([instruct_prefix, prefill], dim=1)
     return prefill, trailing_text_hidden, tts_pad_embed
@@ -513,7 +547,8 @@ def conditioned_token_logits(
     sample: dict[str, Any],
     codes: torch.Tensor,
     *,
-    x_vector_only_mode: bool,
+    conditioning: str | None = None,
+    x_vector_only_mode: bool | None = None,
     non_streaming_mode: bool,
     prompt_cache: dict[tuple[str, str | None, bool], Any] | None = None,
 ) -> TokenLogits:
@@ -525,15 +560,38 @@ def conditioned_token_logits(
     if codes.shape[1] != model.talker.config.num_code_groups:
         raise ValueError(f"codes have {codes.shape[1]} codebooks, expected {model.talker.config.num_code_groups}")
 
-    prefill, trailing_text_hidden, tts_pad_embed = build_voice_clone_prefill(
-        tts,
-        sample,
-        x_vector_only_mode=x_vector_only_mode,
-        non_streaming_mode=non_streaming_mode,
-        prompt_cache=prompt_cache,
-    )
+    if conditioning == "voice_design":
+        if model.tts_model_type != "voice_design":
+            raise ValueError(f"voice_design conditioning requires a VoiceDesign model, got {model.tts_model_type}")
+        prefill, trailing_text_hidden, tts_pad_embed = build_voice_design_prefill(
+            tts,
+            sample,
+            non_streaming_mode=non_streaming_mode,
+        )
+    else:
+        if conditioning == "teacher_icl":
+            x_vector_only_mode = False
+        elif conditioning == "student_xvector":
+            x_vector_only_mode = True
+        elif conditioning is not None:
+            raise ValueError(f"unknown conditioning mode: {conditioning}")
+        if x_vector_only_mode is None:
+            raise ValueError("set conditioning or x_vector_only_mode")
+        if model.tts_model_type != "base":
+            raise ValueError(f"voice-clone conditioning requires a Base model, got {model.tts_model_type}")
+        prefill, trailing_text_hidden, tts_pad_embed = build_voice_clone_prefill(
+            tts,
+            sample,
+            x_vector_only_mode=x_vector_only_mode,
+            non_streaming_mode=non_streaming_mode,
+            prompt_cache=prompt_cache,
+        )
     return _replay_token_logits(
-        model, codes, prefill, trailing_text_hidden, tts_pad_embed
+        model,
+        codes,
+        prefill,
+        trailing_text_hidden,
+        tts_pad_embed,
     )
 
 
@@ -546,21 +604,22 @@ def voice_design_token_logits(
 ) -> TokenLogits:
     """Teacher-force codec frames through VoiceDesign with text+caption only."""
 
-    model = tts.model
-    device = next(model.parameters()).device
-    codes = codes.to(device=device, dtype=torch.long)
-    if codes.ndim != 2:
-        raise ValueError(f"codes must be [T, Q], got shape {tuple(codes.shape)}")
-    if codes.shape[1] != model.talker.config.num_code_groups:
-        raise ValueError(
-            f"codes have {codes.shape[1]} codebooks, expected {model.talker.config.num_code_groups}"
-        )
-    prefill, trailing_text_hidden, tts_pad_embed = build_voice_design_prefill(
-        tts, sample, non_streaming_mode=non_streaming_mode
+    return conditioned_token_logits(
+        tts,
+        sample,
+        codes,
+        conditioning="voice_design",
+        non_streaming_mode=non_streaming_mode,
     )
-    return _replay_token_logits(
-        model, codes, prefill, trailing_text_hidden, tts_pad_embed
-    )
+
+
+def first_codebook_logits_with_eos(logits: TokenLogits) -> torch.Tensor:
+    return torch.cat([logits.first_codebook, logits.eos], dim=0)
+
+
+def first_codebook_labels_with_eos(model, codes: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    eos = torch.tensor([model.config.talker_config.codec_eos_token_id], device=device, dtype=torch.long)
+    return torch.cat([codes[:, 0].to(device=device, dtype=torch.long), eos], dim=0)
 
 
 @torch.no_grad()
@@ -568,14 +627,25 @@ def generate_student_codes(tts, sample: dict[str, Any], args) -> torch.Tensor:
     was_training = tts.model.training
     tts.model.eval()
     try:
-        input_ids, instruct_id, ref_id, prompt = _prompt_for_sample(
-            tts, sample, x_vector_only_mode=True
-        )
+        generate_kwargs: dict[str, Any] = {}
+        if tts.model.tts_model_type == "voice_design":
+            input_id, instruct_id = voice_design_inputs(tts, sample)
+        elif tts.model.tts_model_type == "base":
+            input_id, instruct_id, ref_id, prompt = _prompt_for_sample(
+                tts, sample, x_vector_only_mode=True
+            )
+            generate_kwargs = {
+                "ref_ids": [ref_id.to(tts.device) if ref_id is not None else None],
+                "voice_clone_prompt": prompt,
+            }
+        else:
+            raise ValueError(
+                f"unsupported OPD student model type: {tts.model.tts_model_type}"
+            )
         codes, _ = tts.model.generate(
-            input_ids=[input_ids.to(tts.device)],
+            input_ids=[input_id.to(tts.device)],
             instruct_ids=[instruct_id.to(tts.device) if instruct_id is not None else None],
-            ref_ids=[ref_id.to(tts.device) if ref_id is not None else None],
-            voice_clone_prompt=prompt,
+            **generate_kwargs,
             languages=[sample.get("language", "Auto")],
             non_streaming_mode=args.non_streaming_mode,
             do_sample=True,

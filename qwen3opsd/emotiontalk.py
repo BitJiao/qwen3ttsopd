@@ -165,8 +165,8 @@ def load_utterances(
     return utterances
 
 
-def _base_row(item: Utterance, enrollment: Utterance) -> dict[str, Any]:
-    return {
+def _base_row(item: Utterance, enrollment: Utterance | None) -> dict[str, Any]:
+    row = {
         "sample_id": item.sample_id,
         "text": item.text,
         "instruction": item.instruction,
@@ -177,9 +177,11 @@ def _base_row(item: Utterance, enrollment: Utterance) -> dict[str, Any]:
         "emotion": item.emotion,
         "audio": str(item.audio),
         "target_audio": str(item.audio),
-        "student_spk_audio": str(enrollment.audio),
-        "ref_audio": str(enrollment.audio),
     }
+    if enrollment is not None:
+        row["student_spk_audio"] = str(enrollment.audio)
+        row["ref_audio"] = str(enrollment.audio)
+    return row
 
 
 def _group_problem(
@@ -221,17 +223,24 @@ def convert(
     on_invalid_group: str,
     check_audio_hash: bool,
     limit: int | None,
+    student_mode: str = "base",
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    by_speaker_split: dict[tuple[str, str], list[Utterance]] = defaultdict(list)
-    for item in utterances:
-        by_speaker_split[(split_for_scene(item.scene_id), item.speaker_id)].append(item)
-    enrollment = {
-        key: min(items, key=lambda item: (item.scene_id, item.sequence, item.key))
-        for key, items in by_speaker_split.items()
-    }
-    enrollment_ids = {item.sample_id for item in enrollment.values()}
-    targets = [item for item in utterances if item.sample_id not in enrollment_ids]
+    if student_mode not in {"base", "voice_design"}:
+        raise ValueError(f"unsupported student_mode: {student_mode}")
+    enrollment: dict[tuple[str, str], Utterance] = {}
+    if student_mode == "base":
+        by_speaker_split: dict[tuple[str, str], list[Utterance]] = defaultdict(list)
+        for item in utterances:
+            by_speaker_split[(split_for_scene(item.scene_id), item.speaker_id)].append(item)
+        enrollment = {
+            key: min(items, key=lambda item: (item.scene_id, item.sequence, item.key))
+            for key, items in by_speaker_split.items()
+        }
+        enrollment_ids = {item.sample_id for item in enrollment.values()}
+        targets = [item for item in utterances if item.sample_id not in enrollment_ids]
+    else:
+        targets = list(utterances)
     targets.sort(key=lambda item: (item.scene_id, item.speaker_id, item.sequence, item.key))
     if limit is not None:
         targets = targets[:limit]
@@ -239,7 +248,7 @@ def convert(
     sft: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for item in targets:
         split = split_for_scene(item.scene_id)
-        sft[split].append(_base_row(item, enrollment[(split, item.speaker_id)]))
+        sft[split].append(_base_row(item, enrollment.get((split, item.speaker_id))))
 
     grouped: dict[tuple[str, str], list[Utterance]] = defaultdict(list)
     for item in targets:
@@ -252,11 +261,11 @@ def convert(
     for (speaker_id, scene_id), group in sorted(grouped.items()):
         group.sort(key=lambda item: (item.sequence, item.key))
         problem = _group_problem(group, check_audio_hash, hash_cache)
-        if problem is None and check_audio_hash:
+        if problem is None and check_audio_hash and student_mode == "base":
             split = split_for_scene(scene_id)
             enrollment_audio = enrollment[(split, speaker_id)].audio.resolve()
             enrollment_hash = cached_sha256(enrollment_audio, hash_cache)
-            if any(hash_cache[item.audio.resolve()] == enrollment_hash for item in group):
+            if any(cached_sha256(item.audio.resolve(), hash_cache) == enrollment_hash for item in group):
                 problem = "target_matches_student_enrollment_content"
         if problem is not None:
             skipped[problem] += 1
@@ -276,7 +285,7 @@ def convert(
         for index, item in enumerate(group):
             teacher = group[(index + 1) % len(group)]
             split = split_for_scene(item.scene_id)
-            row = _base_row(item, enrollment[(split, item.speaker_id)])
+            row = _base_row(item, enrollment.get((split, item.speaker_id)))
             row.update(
                 {
                     "teacher_ref_audio": str(teacher.audio),
@@ -305,15 +314,21 @@ def convert(
             }
         )
 
-    counts: dict[str, Any] = {"source_rows": len(utterances), "enrollment_rows": len(enrollment)}
+    counts: dict[str, Any] = {
+        "source_rows": len(utterances),
+        "student_mode": student_mode,
+        "enrollment_rows": len(enrollment),
+    }
     for split in ("train", "val", "test"):
         target_counts = Counter(row["target_audio"] for row in opd[split])
         reference_counts = Counter(row["teacher_ref_audio"] for row in opd[split])
         if target_counts != reference_counts or any(count != 1 for count in reference_counts.values()):
             raise AssertionError(f"{split} OPD cycle does not use every target exactly once as teacher reference")
         for row in opd[split]:
-            if row["target_audio"] in {row["teacher_ref_audio"], row["student_spk_audio"]}:
+            if row["target_audio"] == row["teacher_ref_audio"]:
                 raise AssertionError(f"audio leakage in {row['sample_id']}")
+            if student_mode == "base" and row["target_audio"] == row["student_spk_audio"]:
+                raise AssertionError(f"student enrollment leakage in {row['sample_id']}")
         counts[f"sft_{split}"] = write_jsonl(output_dir / f"sft_{split}.jsonl", sft[split])
         counts[f"opd_{split}"] = write_jsonl(output_dir / f"opd_{split}.jsonl", opd[split])
     counts["audit_groups"] = write_jsonl(output_dir / "group_audit.jsonl", audit)
@@ -340,6 +355,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--check-audio", action="store_true")
     parser.add_argument("--check-audio-hash", action="store_true")
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--student-mode", choices=["base", "voice_design"], default="base")
     return parser.parse_args()
 
 
@@ -352,7 +368,14 @@ def main() -> None:
         args.caption_key,
         args.check_audio,
     )
-    summary = convert(utterances, args.output_dir, args.on_invalid_group, args.check_audio_hash, args.limit)
+    summary = convert(
+        utterances,
+        args.output_dir,
+        args.on_invalid_group,
+        args.check_audio_hash,
+        args.limit,
+        student_mode=args.student_mode,
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

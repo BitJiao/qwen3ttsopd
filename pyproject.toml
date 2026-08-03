@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qwen3tts-opd"
-version = "0.2.0"
-description = "Instruction SFT and ICL teacher on-policy distillation for Qwen3-TTS Base."
+version = "0.3.0"
+description = "VoiceDesign instruction SFT with Base-ICL teacher on-policy distillation for Qwen3-TTS."
 requires-python = ">=3.10"
 readme = "README.md"
 

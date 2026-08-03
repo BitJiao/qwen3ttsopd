@@ -28,7 +28,7 @@ class EmotionTalkConversionTest(unittest.TestCase):
         self.assertEqual(sample, "G00009__G00009_42__G00009_42_14__G00009_42_14_024")
         self.assertEqual(clean_transcript("[over/]hello[/over] [interrupted]world"), "hello world")
 
-    def test_cycle_and_enrollment_are_disjoint(self) -> None:
+    def test_cycle_has_no_target_reference_leakage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             audio_root = root / "audio"
@@ -60,18 +60,28 @@ class EmotionTalkConversionTest(unittest.TestCase):
                         }
                     )
             rows = load_utterances(transcription, captions, audio_root, "caption_1", True)
-            summary = convert(rows, output, "error", True, None)
-            self.assertEqual(summary["sft_train"], 3)
+            summary = convert(rows, output, "skip", True, None, student_mode="voice_design")
+            self.assertEqual(summary["sft_train"], 4)
             self.assertEqual(summary["opd_train"], 3)
             with (output / "opd_train.jsonl").open(encoding="utf-8") as handle:
                 opd = [json.loads(line) for line in handle]
+            self.assertTrue(all("student_spk_audio" not in row for row in opd))
             targets = {row["target_audio"] for row in opd}
             references = {row["teacher_ref_audio"] for row in opd}
             self.assertEqual(targets, references)
             for row in opd:
                 self.assertNotEqual(row["target_audio"], row["teacher_ref_audio"])
-                self.assertNotEqual(row["target_audio"], row["student_spk_audio"])
-                self.assertNotEqual(row["teacher_ref_audio"], row["student_spk_audio"])
+
+            base_output = root / "base_output"
+            base_summary = convert(rows, base_output, "skip", True, None, student_mode="base")
+            self.assertEqual(base_summary["sft_train"], 3)
+            self.assertEqual(base_summary["opd_train"], 3)
+            with (base_output / "opd_train.jsonl").open(encoding="utf-8") as handle:
+                base_opd = [json.loads(line) for line in handle]
+            self.assertTrue(all(row.get("student_spk_audio") for row in base_opd))
+            self.assertTrue(
+                all(row["target_audio"] != row["student_spk_audio"] for row in base_opd)
+            )
 
 
 if __name__ == "__main__":
